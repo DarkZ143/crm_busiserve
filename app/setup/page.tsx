@@ -61,7 +61,7 @@ async function SetupPageState() {
         <code>Collection: users</code>
         <code>Document ID: the exact Authentication UID</code>
         <code>uid: same UID (string)</code>
-        <code>displayName: user's name (string)</code>
+        <code>displayName: user&apos;s name (string)</code>
         <code>email: same Authentication email (string)</code>
         <code>role: super_admin (string)</code>
         <code>accountStatus: active (string)</code>

@@ -2,7 +2,7 @@ import "server-only";
 
 import { FieldPath, FieldValue, Filter, type Query, type WriteBatch } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
-import { canReadRecord } from "@/lib/access-control";
+import { canReadCollection, canReadRecord } from "@/lib/access-control";
 import { redactRecordForRole } from "@/lib/record-security";
 import type { CollectionName, RecordData, Role, SessionUser } from "@/lib/types";
 import { serializeRecord } from "@/lib/http";
@@ -36,11 +36,13 @@ async function scopedQuery(collection: CollectionName, user: SessionUser): Promi
   const rows = db.collection(collection);
 
   if (collection === "clients") {
-    if (user.role === "super_admin" || user.role === "cto") return rows;
+    if (user.role === "super_admin") return rows;
+    if (user.role === "cto") return rows.where("createdBy", "==", user.uid);
     if (user.role === "product_manager") return rows.where(Filter.or(
       Filter.where("createdBy", "==", user.uid),
       Filter.where("assignedProductManager", "==", user.uid),
     ));
+    if (user.role === "team_member") return rows.where("createdBy", "==", user.uid);
     return rows.where(FieldPath.documentId(), "==", "__no_access__");
   }
   if (collection === "projects") {
@@ -93,6 +95,7 @@ async function scopedQuery(collection: CollectionName, user: SessionUser): Promi
 }
 
 export async function listRecords(collection: CollectionName, user: SessionUser) {
+  if (!canReadCollection(user.role, collection)) return [];
   let documents: FirebaseFirestore.QueryDocumentSnapshot[];
   let scopedProjectIds: ReadonlySet<string> | undefined;
   const managerScopedTasks = (collection === "tasks" || collection === "workReports") && (user.role === "cto" || user.role === "product_manager");

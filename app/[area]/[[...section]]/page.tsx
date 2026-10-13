@@ -14,9 +14,9 @@ type PageParameters = { params: Promise<{ area: string; section?: string[] }> };
 
 const roleHome: Record<Role, string> = {
   super_admin: "/admin/dashboard",
-  cto: "/cto/dashboard",
-  product_manager: "/product-manager/dashboard",
-  team_member: "/workspace/dashboard",
+  cto: "/cto/projects",
+  product_manager: "/product-manager/projects",
+  team_member: "/workspace/projects",
 };
 
 const titleBySection: Record<string, string> = {
@@ -52,16 +52,16 @@ function sectionCollection(section: string): CollectionName | null {
 }
 
 function allowedSection(area: string, section: string, role: Role) {
+  if (role !== "super_admin") return section === "clients" || section === "projects";
   const common = ["dashboard"];
   const areas: Record<string, string[]> = {
     admin: ["users", "clients", "projects", "tasks", "reports", "analytics", "audit-logs", "settings", "notifications"],
     cto: ["clients", "project-requests", "projects", "team", "tasks", "reports", "milestones", "notifications"],
     "product-manager": ["clients", "projects", "project-requests", "updates"],
-    workspace: ["projects", "tasks", "daily-reports", "history", "notifications"],
+    workspace: ["projects", "clients", "tasks", "daily-reports", "history", "notifications"],
   };
   if (common.includes(section)) return true;
   if (!areas[area]?.includes(section)) return false;
-  if ((section === "users" || section === "team") && role === "product_manager") return false;
   return true;
 }
 
@@ -83,6 +83,7 @@ async function WorkspaceRouteContent({ params }: PageParameters) {
   const nestedAction = routeParts[1] || "";
   if (!canAccessArea(user.role, area)) redirect(roleHome[user.role]);
   if (!allowedSection(area, section, user.role)) notFound();
+  if (nestedAction === "new" && user.role !== "super_admin" && section !== "clients") notFound();
 
   const title = nestedAction === "new" ? `New ${titleBySection[section]?.toLowerCase() ?? "record"}` : titleBySection[section];
   if (!title) notFound();
@@ -120,7 +121,7 @@ async function getAuxiliaryRecords(section: string, user: SessionUser) {
   };
   const lookups: Record<string, (keyof typeof empty)[]> = {
     "project-requests": ["clients"],
-    projects: ["clients", "requests", "users"],
+    projects: user.role === "super_admin" ? ["clients", "requests", "users"] : [],
     tasks: ["projects", "users"],
     "daily-reports": ["projects", "tasks"],
     milestones: ["projects"],
@@ -128,7 +129,7 @@ async function getAuxiliaryRecords(section: string, user: SessionUser) {
     reports: ["projects"],
     users: [],
     team: [],
-    clients: ["users"],
+    clients: user.role === "super_admin" ? ["users"] : [],
     notifications: [],
     updates: [],
   };
@@ -137,7 +138,7 @@ async function getAuxiliaryRecords(section: string, user: SessionUser) {
     clients: "clients", projects: "projects", tasks: "tasks", users: "users", requests: "projectRequests", notifications: "notifications",
   };
   const pairs = await Promise.all(keys.map(async (key) => [key, await listRecords(collectionByKey[key], user)] as const));
-  const result = { ...empty, notifications: await listRecords("notifications", user) };
+  const result = { ...empty, notifications: user.role === "super_admin" ? await listRecords("notifications", user) : [] };
   for (const [key, records] of pairs) result[key] = records;
   return result;
 }

@@ -8,6 +8,7 @@ function without(record: RecordData, fields: string[]): RecordData {
 
 export function redactRecordForRole(collection: CollectionName, record: RecordData, role: Role): RecordData {
   if (role === "super_admin") return record;
+  if (collection === "clients") return without(record, ["internalNotes", "officialEmailNormalized"]);
   if (collection === "users" && role === "cto") return without(record, ["email", "accountStatus", "createdBy"]);
   if (role === "cto") return record;
   if (collection === "projectRequests") return without(record, ["proposedPrice", "contractPrice", "internalNotes"]);

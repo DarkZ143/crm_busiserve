@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { randomUUID } from "node:crypto";
 import { FieldValue } from "firebase-admin/firestore";
 import { z } from "zod";
 import { adminAuth, adminDb } from "@/lib/firebase-admin";
@@ -100,8 +99,10 @@ const reportSchema = z.object({
 });
 
 const inviteSchema = z.object({
+  uid: z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/, "Use letters, numbers, dashes, and underscores for the user ID.").optional(),
   displayName: z.string().trim().min(2).max(100),
   email: z.email().max(254).transform((value) => value.trim().toLowerCase()),
+  password: z.string().min(12).max(128),
   role: z.enum(roles),
   designation: z.string().trim().max(100).optional().default(""),
 });
@@ -112,22 +113,30 @@ function ensureCollection(value: string): CollectionName {
 }
 
 async function createClient(request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
-  if (user.role !== "super_admin" && user.role !== "product_manager") throw new HttpError("You cannot create client records.", 403);
   const input = await parseBody(request, clientSchema);
   const db = adminDb();
-  const assignedProductManager = user.role === "product_manager" ? user.uid : input.assignedProductManager || user.uid;
-  const manager = await db.collection("users").doc(assignedProductManager).get();
-  if (!manager.exists || manager.data()?.role !== "product_manager" || manager.data()?.accountStatus !== "active") {
+  const assignedProductManager = user.role === "super_admin"
+    ? input.assignedProductManager ?? ""
+    : user.role === "product_manager" ? user.uid : "";
+  const manager = assignedProductManager ? await db.collection("users").doc(assignedProductManager).get() : null;
+  if (assignedProductManager && (!manager?.exists || manager.data()?.role !== "product_manager" || manager.data()?.accountStatus !== "active")) {
     throw new HttpError("Choose an active Product Manager for this client.", 400);
   }
+  const approved = user.role === "super_admin";
   const ref = db.collection("clients").doc();
   const auditRef = db.collection("auditLogs").doc();
   const record = {
     ...input,
+    internalNotes: user.role === "super_admin" ? input.internalNotes : "",
     id: ref.id,
     clientId: `CLI-${ref.id.slice(0, 8).toUpperCase()}`,
     officialEmailNormalized: input.officialEmail,
     assignedProductManager,
+    approvalStatus: approved ? "approved" : "pending",
+    approvalComments: "",
+    reviewedBy: approved ? user.uid : null,
+    reviewedAt: approved ? FieldValue.serverTimestamp() : null,
+    status: approved ? input.status : "draft",
     createdBy: user.uid,
     createdAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
@@ -136,9 +145,16 @@ async function createClient(request: Request, user: Awaited<ReturnType<typeof re
     const duplicate = await transaction.get(db.collection("clients").where("officialEmailNormalized", "==", input.officialEmail).limit(1));
     if (!duplicate.empty) throw new HttpError("A client already exists with this email address.", 409);
     transaction.set(ref, record);
-    transaction.set(auditRef, auditEntry(user, "client_created", "clients", ref.id, { clientName: input.clientName }));
+    transaction.set(auditRef, auditEntry(user, approved ? "client_created" : "client_submitted_for_approval", "clients", ref.id, { clientName: input.clientName }));
   });
-  return redactRecordForRole("clients", { id: ref.id, ...input, clientId: `CLI-${ref.id.slice(0, 8).toUpperCase()}` }, user.role);
+  if (!approved) {
+    void notifyRole("super_admin", "Client approval needed", `${input.clientName} was submitted by ${user.displayName}.`, "/admin/clients", "client_submitted").catch(() => undefined);
+  }
+  return redactRecordForRole("clients", { ...record, id: ref.id, clientId: `CLI-${ref.id.slice(0, 8).toUpperCase()}` }, user.role);
+}
+
+function isClientApproved(client: FirebaseFirestore.DocumentData) {
+  return client.approvalStatus === undefined ? client.status !== "draft" : client.approvalStatus === "approved";
 }
 
 async function createProjectRequest(request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
@@ -147,6 +163,7 @@ async function createProjectRequest(request: Request, user: Awaited<ReturnType<t
   const db = adminDb();
   const client = await db.collection("clients").doc(input.clientId).get();
   if (!client.exists) throw new HttpError("The selected client was not found.", 404);
+  if (!isClientApproved(client.data()!)) throw new HttpError("This client is awaiting Super Admin approval.", 409);
   if (user.role === "product_manager" && client.data()?.createdBy !== user.uid && client.data()?.assignedProductManager !== user.uid) throw new HttpError("You cannot submit a request for this client.", 403);
   const ref = db.collection("projectRequests").doc();
   const batch = db.batch();
@@ -177,6 +194,7 @@ async function createProject(request: Request, user: Awaited<ReturnType<typeof r
     Promise.all(input.assignedTeam.map((uid) => db.collection("users").doc(uid).get())),
   ]);
   if (!client.exists) throw new HttpError("The selected client was not found.", 404);
+  if (!isClientApproved(client.data()!)) throw new HttpError("This client is awaiting Super Admin approval.", 409);
   if (members.some((member) => !member.exists || member.data()?.role !== "team_member" || member.data()?.accountStatus !== "active")) {
     throw new HttpError("Only active team members can be assigned to a project.", 400);
   }
@@ -313,42 +331,57 @@ async function inviteUser(request: Request, user: Awaited<ReturnType<typeof requ
   if (user.role !== "super_admin") throw new HttpError("Only a Super Admin can invite users.", 403);
   const input = await parseBody(request, inviteSchema);
   const db = adminDb();
+  if (input.uid && (await Promise.all([
+    db.collection("users").doc(input.uid).get(),
+    db.collection("deletedUserIds").doc(input.uid).get(),
+  ])).some((snapshot) => snapshot.exists)) {
+    throw new HttpError("That user ID is already in use.", 409);
+  }
   let authUser;
   try {
     authUser = await adminAuth().createUser({
+      ...(input.uid ? { uid: input.uid } : {}),
       email: input.email,
       displayName: input.displayName,
-      password: `${randomUUID()}aA1!`,
+      password: input.password,
       disabled: false,
     });
   } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "auth/email-already-exists") throw new HttpError("An account already exists for this email.", 409);
+    if (error instanceof Error && "code" in error) {
+      if (error.code === "auth/email-already-exists") throw new HttpError("An account already exists for this email.", 409);
+      if (error.code === "auth/uid-already-exists") throw new HttpError("That user ID is already in use.", 409);
+    }
     throw error;
   }
-  let inviteLink: string;
   try {
     await adminAuth().setCustomUserClaims(authUser.uid, { role: input.role });
-    const continueUrl = process.env.APP_ORIGIN;
-    inviteLink = await adminAuth().generatePasswordResetLink(input.email, continueUrl ? { url: `${continueUrl}/login`, handleCodeInApp: false } : undefined);
-    const batch = db.batch();
-    batch.set(db.collection("users").doc(authUser.uid), {
-      uid: authUser.uid,
-      displayName: input.displayName,
-      email: input.email,
-      role: input.role,
-      designation: input.designation,
-      accountStatus: "active",
-      createdBy: user.uid,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
+    const profileRef = db.collection("users").doc(authUser.uid);
+    const retiredIdRef = db.collection("deletedUserIds").doc(authUser.uid);
+    const auditRef = db.collection("auditLogs").doc();
+    await db.runTransaction(async (transaction) => {
+      const [profile, retiredId] = await Promise.all([
+        transaction.get(profileRef),
+        transaction.get(retiredIdRef),
+      ]);
+      if (profile.exists || retiredId.exists) throw new HttpError("That user ID is already in use.", 409);
+      transaction.set(profileRef, {
+        uid: authUser.uid,
+        displayName: input.displayName,
+        email: input.email,
+        role: input.role,
+        designation: input.designation,
+        accountStatus: "active",
+        createdBy: user.uid,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.set(auditRef, auditEntry(user, "user_created", "users", authUser.uid, { role: input.role, email: input.email }));
     });
-    addAuditToBatch(batch, user, "user_invited", "users", authUser.uid, { role: input.role, email: input.email });
-    await batch.commit();
   } catch (error) {
     await adminAuth().deleteUser(authUser.uid).catch(() => undefined);
     throw error;
   }
-  return { id: authUser.uid, displayName: input.displayName, email: input.email, role: input.role, inviteLink };
+  return { id: authUser.uid, uid: authUser.uid, displayName: input.displayName, email: input.email, role: input.role };
 }
 
 export async function GET(_request: Request, context: { params: Promise<{ collection: string }> }) {
@@ -356,6 +389,9 @@ export async function GET(_request: Request, context: { params: Promise<{ collec
     const user = await requireSessionUser();
     const { collection: rawCollection } = await context.params;
     const collection = ensureCollection(rawCollection);
+    if (user.role !== "super_admin" && collection !== "clients" && collection !== "projects") {
+      throw new HttpError("Only projects and client submissions are available to your role.", 403);
+    }
     const records = await listRecords(collection, user);
     return NextResponse.json({ records });
   } catch (error) {
@@ -369,6 +405,9 @@ export async function POST(request: Request, context: { params: Promise<{ collec
     const user = await requireSessionUser();
     const { collection: rawCollection } = await context.params;
     const collection = ensureCollection(rawCollection);
+    if (user.role !== "super_admin" && collection !== "clients") {
+      throw new HttpError("You can only submit client records.", 403);
+    }
     let record;
     if (collection === "clients") record = await createClient(request, user);
     else if (collection === "projectRequests") record = await createProjectRequest(request, user);

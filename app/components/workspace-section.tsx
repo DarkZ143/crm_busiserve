@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { Bell, Building2, Check, ChevronLeft, ChevronRight, ClipboardCheck, ClipboardList, FileClock, FolderKanban, ListTodo, Plus, Search, ShieldAlert, UserPlus, X } from "lucide-react";
+import { Bell, Building2, Check, ChevronLeft, ChevronRight, ClipboardCheck, ClipboardList, FileClock, FolderKanban, ListTodo, Plus, Search, ShieldAlert, Trash2, UserPlus, X } from "lucide-react";
 import { CompanySettings } from "@/app/components/company-settings";
 import type { CollectionName, RecordData, Role, SessionUser } from "@/lib/types";
 
@@ -13,7 +13,7 @@ type Option = { value: string; label: string };
 type Field = {
   name: string;
   label: string;
-  type?: "text" | "email" | "number" | "date" | "textarea" | "select";
+  type?: "text" | "email" | "password" | "number" | "date" | "textarea" | "select";
   required?: boolean;
   full?: boolean;
   options?: Option[];
@@ -46,7 +46,8 @@ const projectStatusOptions: Option[] = [
 const columns: Partial<Record<CollectionName, { key: string; label: string; primary?: boolean }[]>> = {
   clients: [
     { key: "clientName", label: "Client", primary: true }, { key: "companyName", label: "Company" },
-    { key: "officialEmail", label: "Email" }, { key: "industry", label: "Industry" }, { key: "status", label: "Status" },
+    { key: "officialEmail", label: "Email" }, { key: "industry", label: "Industry" },
+    { key: "approvalStatus", label: "Approval" }, { key: "approvalComments", label: "Review notes" }, { key: "status", label: "Status" },
   ],
   projects: [
     { key: "name", label: "Project", primary: true }, { key: "projectId", label: "ID" }, { key: "status", label: "Status" },
@@ -69,7 +70,7 @@ const columns: Partial<Record<CollectionName, { key: string; label: string; prim
     { key: "timeSpentHours", label: "Hours" }, { key: "status", label: "Status" },
   ],
   users: [
-    { key: "displayName", label: "Name", primary: true }, { key: "email", label: "Email" }, { key: "role", label: "Role" },
+    { key: "uid", label: "User ID" }, { key: "displayName", label: "Name", primary: true }, { key: "email", label: "Login email" }, { key: "role", label: "Role" },
     { key: "designation", label: "Designation" }, { key: "accountStatus", label: "Access" },
   ],
   auditLogs: [
@@ -105,9 +106,9 @@ function createFields(collection: CollectionName | null, role: Role, auxiliary: 
     { name: "businessAddress", label: "Business address", full: true },
     { name: "requirements", label: "Client requirements", type: "textarea", full: true },
     { name: "objectives", label: "Project objectives", type: "textarea", full: true },
-    { name: "internalNotes", label: "Internal notes", type: "textarea", full: true },
-    ...(role === "super_admin" ? [{ name: "assignedProductManager", label: "Product Manager", type: "select" as const, required: true, options: fieldOptions(auxiliary.users.filter((record) => record.role === "product_manager"), "id", "displayName") }] : []),
-    { name: "status", label: "Status", type: "select", options: statusOptions },
+    ...(role === "super_admin" ? [{ name: "internalNotes", label: "Internal notes", type: "textarea" as const, full: true }] : []),
+    ...(role === "super_admin" ? [{ name: "assignedProductManager", label: "Product Manager", type: "select" as const, options: fieldOptions(auxiliary.users.filter((record) => record.role === "product_manager" && record.accountStatus === "active"), "id", "displayName") }] : []),
+    ...(role === "super_admin" ? [{ name: "status", label: "Client status", type: "select" as const, options: statusOptions }] : []),
   ];
   if (collection === "projectRequests") return [
     { name: "clientId", label: "Client", type: "select", required: true, options: fieldOptions(auxiliary.clients, "id", "clientName") },
@@ -167,8 +168,10 @@ function createFields(collection: CollectionName | null, role: Role, auxiliary: 
     { name: "blockers", label: "Blockers or issues", type: "textarea", full: true },
   ];
   if (collection === "users") return [
+    { name: "uid", label: "User ID", required: true, placeholder: "e.g. BUS-EMP-014" },
     { name: "displayName", label: "Full name", required: true },
-    { name: "email", label: "Work email", type: "email", required: true },
+    { name: "email", label: "Login ID (work email)", type: "email", required: true },
+    { name: "password", label: "Initial password", type: "password", required: true, full: true, placeholder: "At least 12 characters" },
     { name: "role", label: "Role", type: "select", required: true, options: roleOptions() },
     { name: "designation", label: "Team designation", placeholder: "Developer, Designer, QA…" },
   ];
@@ -193,7 +196,7 @@ function dateDisplay(value: unknown) {
 }
 
 function emptyMessage(collection: CollectionName | null, section: string) {
-  if (collection === "clients") return "Client records created by your authorized team will appear here.";
+  if (collection === "clients") return "Client submissions and their approval decisions will appear here.";
   if (collection === "projects") return "Projects assigned to your role will appear here when they are created.";
   if (collection === "projectRequests") return "Project requests and review decisions will appear here.";
   if (collection === "tasks") return "Tasks assigned to your project teams will appear here.";
@@ -213,6 +216,7 @@ function createSchema(fields: Field[]) {
     if (field.multiple) value = z.array(z.string());
     else if (field.type === "number" && field.required) value = z.coerce.number().min(field.min ?? 0);
     else if (field.type === "number") value = z.preprocess((input) => input === "" ? undefined : input, z.coerce.number().optional());
+    else if (field.name === "password") value = z.string().min(12, "Use at least 12 characters.").max(128);
     else if (field.required) value = z.string().trim().min(1, `${field.label} is required.`);
     else value = z.string().optional();
     shape[field.name] = value;
@@ -289,7 +293,7 @@ function RecordForm({
                   {(field.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
               ) : (
-                <input className="text-input" id={`field-${field.name}`} type={field.type ?? "text"} placeholder={field.placeholder} min={field.min} max={field.max} maxLength={field.type === "number" ? undefined : 500} {...form.register(field.name)} />
+                <input className="text-input" id={`field-${field.name}`} type={field.type ?? "text"} placeholder={field.placeholder} min={field.min} max={field.max} minLength={field.name === "password" ? 12 : undefined} maxLength={field.name === "password" ? 128 : field.type === "number" ? undefined : 500} autoComplete={field.name === "password" ? "new-password" : undefined} {...form.register(field.name)} />
               )}
               {form.formState.errors[field.name] && <span className="form-field-error">{String(form.formState.errors[field.name]?.message ?? "Check this field.")}</span>}
             </div>
@@ -305,25 +309,34 @@ function RecordForm({
 function ReviewDialog({
   collection,
   record,
+  users,
   onClose,
   onComplete,
 }: {
   collection: CollectionName;
   record: RecordData;
+  users: RecordData[];
   onClose: () => void;
   onComplete: () => void;
 }) {
-  const [action, setAction] = useState(collection === "projectRequests" ? "approve" : "accepted");
-  const [comments, setComments] = useState("");
+  const requestKind = collection === "projectRequests";
+  const clientKind = collection === "clients";
+  const currentManager = users.find((user) => user.id === record.assignedProductManager && user.role === "product_manager" && user.accountStatus === "active");
+  const [action, setAction] = useState(requestKind || clientKind ? "approve" : "accepted");
+  const [comments, setComments] = useState(String(record.approvalComments ?? ""));
+  const [assignedProductManager, setAssignedProductManager] = useState(String(currentManager?.id ?? ""));
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
-  const requestKind = collection === "projectRequests";
 
   async function submit() {
     setPending(true);
     setError("");
     try {
-      const body = requestKind ? { action, reviewerComments: comments } : { operation: "review", status: action, reviewerComments: comments };
+      const body = requestKind
+        ? { action, reviewerComments: comments }
+        : clientKind
+          ? { operation: "review", action, assignedProductManager, reviewerComments: comments }
+          : { operation: "review", status: action, reviewerComments: comments };
       const response = await fetch(`/api/records/${collection}/${record.id}`, {
         method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
       });
@@ -340,12 +353,19 @@ function ReviewDialog({
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="modal-card" role="dialog" aria-modal="true" aria-label="Review record">
-        <header className="modal-header"><div><h2>{requestKind ? "Review project request" : "Review work report"}</h2><p>{String(record.projectName ?? record.workSummary ?? "Record")}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={17} /></button></header>
+        <header className="modal-header"><div><h2>{requestKind ? "Review project request" : clientKind ? "Review client submission" : "Review work report"}</h2><p>{String(record.clientName ?? record.projectName ?? record.workSummary ?? "Record")}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={17} /></button></header>
         <div className="review-form">
           <label className="field-label" htmlFor="review-decision">Decision</label>
           <select className="select-input" id="review-decision" value={action} onChange={(event) => setAction(event.target.value)}>
-            {requestKind ? <><option value="approve">Approve</option><option value="request_changes">Request changes</option><option value="reject">Reject</option></> : <><option value="accepted">Accept report</option><option value="under_review">Keep under review</option><option value="changes_requested">Request corrections</option></>}
+            {requestKind ? <><option value="approve">Approve</option><option value="request_changes">Request changes</option><option value="reject">Reject</option></> : clientKind ? <><option value="approve">Approve client</option><option value="reject">Reject client</option></> : <><option value="accepted">Accept report</option><option value="under_review">Keep under review</option><option value="changes_requested">Request corrections</option></>}
           </select>
+          {clientKind && action === "approve" && <>
+            <label className="field-label" htmlFor="client-product-manager">Product Manager (optional)</label>
+            <select className="select-input" id="client-product-manager" value={assignedProductManager} onChange={(event) => setAssignedProductManager(event.target.value)}>
+              <option value="">No Product Manager assigned</option>
+              {users.filter((user) => user.role === "product_manager" && user.accountStatus === "active").map((user) => <option value={String(user.id)} key={user.id}>{String(user.displayName ?? user.id)}</option>)}
+            </select>
+          </>}
           <label className="field-label" htmlFor="review-comments">Comments for the submitter</label>
           <textarea className="textarea-input" id="review-comments" value={comments} onChange={(event) => setComments(event.target.value)} maxLength={4000} placeholder="Add context or requested changes" />
           {error && <div className="form-error-inline" role="alert">{error}</div>}
@@ -380,23 +400,31 @@ export function WorkspaceSection({
   const [formOpen, setFormOpen] = useState(initialNewRecord);
   const [editRecord, setEditRecord] = useState<RecordData | null>(null);
   const [reviewRecord, setReviewRecord] = useState<RecordData | null>(null);
-  const [inviteLink, setInviteLink] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<RecordData | null>(null);
+  const [deleteStage, setDeleteStage] = useState<"confirm" | "password">("confirm");
+  const [deletePassword, setDeletePassword] = useState("");
+  const [deletePending, setDeletePending] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const [createdUser, setCreatedUser] = useState<Record<string, unknown> | null>(null);
   const [rowPending, setRowPending] = useState("");
   const [rowError, setRowError] = useState("");
   const fields = createFields(collection, user.role, auxiliary);
   const canCreate = Boolean(collection && fields.length && (
-    collection === "clients" && (user.role === "super_admin" || user.role === "product_manager") ||
+    collection === "clients" ||
     collection === "projectRequests" && (user.role === "super_admin" || user.role === "product_manager") ||
-    (collection === "projects" || collection === "tasks" || collection === "milestones") && (user.role === "super_admin" || user.role === "cto") ||
+    (collection === "projects" || collection === "tasks" || collection === "milestones") && user.role === "super_admin" ||
     collection === "workReports" && user.role === "team_member" ||
     collection === "users" && user.role === "super_admin"
   ));
   const currentColumns = collection ? columns[collection] ?? [] : [];
   const filtered = useMemo(() => records.filter((record) => {
     const matchesQuery = !query || Object.values(record).some((value) => String(value ?? "").toLowerCase().includes(query.toLowerCase()));
-    const matchesStatus = statusFilter === "all" || String(record.status ?? record.accountStatus ?? "") === statusFilter;
+    const recordStatus = collection === "clients"
+      ? String(record.approvalStatus ?? (record.status === "draft" ? "pending" : "approved"))
+      : String(record.status ?? record.accountStatus ?? "");
+    const matchesStatus = statusFilter === "all" || recordStatus === statusFilter;
     return matchesQuery && matchesStatus;
-  }), [records, query, statusFilter]);
+  }), [records, query, statusFilter, collection]);
   const pageSize = 20;
   const pages = Math.ceil(filtered.length / pageSize);
   const pageRecords = filtered.slice(page * pageSize, (page + 1) * pageSize);
@@ -421,10 +449,46 @@ export function WorkspaceSection({
   }
 
   function formSucceeded(record: Record<string, unknown>) {
-    if (typeof record.inviteLink === "string") setInviteLink(record.inviteLink);
+    if (collection === "users" && typeof record.uid === "string") setCreatedUser(record);
     setFormOpen(false);
     setEditRecord(null);
     router.refresh();
+  }
+
+  function closeDeleteDialog() {
+    if (deletePending) return;
+    setDeleteTarget(null);
+    setDeleteStage("confirm");
+    setDeletePassword("");
+    setDeleteError("");
+  }
+
+  async function confirmTeamMemberDelete() {
+    if (!deleteTarget) return;
+    if (deleteStage === "confirm") {
+      setDeleteError("");
+      setDeleteStage("password");
+      return;
+    }
+    setDeletePending(true);
+    setDeleteError("");
+    try {
+      const response = await fetch(`/api/records/users/${deleteTarget.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ operation: "delete", password: deletePassword }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? "The team member could not be deleted.");
+      setDeleteTarget(null);
+      setDeleteStage("confirm");
+      setDeletePassword("");
+      router.refresh();
+    } catch (reason) {
+      setDeleteError(reason instanceof Error ? reason.message : "The team member could not be deleted.");
+    } finally {
+      setDeletePending(false);
+    }
   }
 
   const canReview = user.role === "super_admin" || user.role === "cto";
@@ -432,7 +496,7 @@ export function WorkspaceSection({
 
   return (
     <>
-      {inviteLink && <div className="invite-result"><div><strong>Invitation link created</strong><span>Share this one-time password setup link with the new team member.</span><code>{inviteLink}</code></div><button className="button button-secondary" type="button" onClick={() => navigator.clipboard.writeText(inviteLink)}><Check size={14} /> Copy link</button><button className="icon-button" type="button" aria-label="Dismiss invitation link" onClick={() => setInviteLink("")}><X size={15} /></button></div>}
+      {createdUser && <div className="invite-result"><div><strong>User account created</strong><span>Share the initial password securely. Passwords are not shown or saved in the user profile.</span><code>User ID: {String(createdUser.uid)} · Login: {String(createdUser.email)}</code></div><button className="icon-button" type="button" aria-label="Dismiss account details" onClick={() => setCreatedUser(null)}><X size={15} /></button></div>}
       {heading && <p className="section-description">{heading === "Company preferences" ? "Manage the workspace timezone and operational defaults." : heading === "Milestones" ? "Milestones are managed within their project plans." : "Updates are limited to the projects and records visible to your role."}</p>}
       {rowError && <div className="notice notice-warning row-error" role="alert"><ShieldAlert size={15} />{rowError}<button className="icon-button" type="button" onClick={() => setRowError("")} aria-label="Dismiss error"><X size={14} /></button></div>}
       {section === "settings" ? (
@@ -446,9 +510,9 @@ export function WorkspaceSection({
             <div className="toolbar-actions">
               <select className="filter-select" aria-label="Filter by status" value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); setPage(0); }}>
                 <option value="all">All statuses</option>
-                {[...new Set(records.map((record) => String(record.status ?? record.accountStatus ?? "")).filter(Boolean))].map((status) => <option value={status} key={status}>{status.replaceAll("_", " ")}</option>)}
+                {[...new Set(records.map((record) => collection === "clients" ? String(record.approvalStatus ?? (record.status === "draft" ? "pending" : "approved")) : String(record.status ?? record.accountStatus ?? "")).filter(Boolean))].map((status) => <option value={status} key={status}>{status.replaceAll("_", " ")}</option>)}
               </select>
-              {canCreate && <button className="button button-primary" type="button" onClick={() => setFormOpen(true)}><Plus size={15} />{collection === "users" ? "Invite user" : `New ${section.replaceAll("-", " ").replace(/s$/, "")}`}</button>}
+              {canCreate && <button className="button button-primary" type="button" onClick={() => setFormOpen(true)}><Plus size={15} />{collection === "users" ? "Create user" : `New ${section.replaceAll("-", " ").replace(/s$/, "")}`}</button>}
             </div>
           </div>
           <div className="table-scroll">
@@ -458,6 +522,10 @@ export function WorkspaceSection({
                 {pageRecords.map((record) => <tr key={record.id}>
                   {currentColumns.map((column) => {
                     const value = record[column.key];
+                    if (column.key === "approvalStatus") {
+                      const approval = value ?? (record.status === "draft" ? "pending" : "approved");
+                      return <td key={column.key}><span className={`status-badge status-${String(approval)}`}>{humanize(approval)}</span></td>;
+                    }
                     if (column.key === "status" || column.key === "accountStatus") return <td key={column.key}><span className={`status-badge status-${String(value ?? "unknown")}`}>{humanize(value)}</span></td>;
                     if (column.primary) return <td className="primary-cell" key={column.key}>{humanize(value)}{collection === "projects" && record.clientName ? <span className="secondary-cell">{humanize(record.clientName)}</span> : null}</td>;
                     if (isDateField(column.key)) return <td key={column.key}>{dateDisplay(value)}</td>;
@@ -474,7 +542,7 @@ export function WorkspaceSection({
                     {collection === "tasks" && user.role === "team_member" && record.status !== "completed" && <button className="small-action" type="button" onClick={() => patchRecord(record.id, "tasks", { status: record.status === "open" ? "in_progress" : "completed" })} disabled={rowPending === record.id}><Check size={12} />{record.status === "open" ? "Start task" : "Complete"}</button>}
                     {collection === "tasks" && (user.role === "cto" || user.role === "super_admin") && <button className="small-action" type="button" onClick={() => patchRecord(record.id, "tasks", { status: record.status === "blocked" ? "open" : "blocked" })} disabled={rowPending === record.id}><ShieldAlert size={12} />{record.status === "blocked" ? "Unblock" : "Block"}</button>}
                     {collection === "milestones" && (user.role === "cto" || user.role === "super_admin") && <button className="small-action" type="button" onClick={() => patchRecord(record.id, "milestones", { status: "completed" })} disabled={rowPending === record.id}><Check size={12} /> Complete</button>}
-                    {collection === "projects" && (user.role === "cto" || user.role === "super_admin") && <button className="small-action" type="button" onClick={() => { setEditRecord(record); setFormOpen(true); }}><FolderKanban size={12} /> Update</button>}
+                    {collection === "projects" && user.role === "super_admin" && <button className="small-action" type="button" onClick={() => { setEditRecord(record); setFormOpen(true); }}><FolderKanban size={12} /> Update</button>}
                     {collection === "users" && user.role === "super_admin" && record.uid !== user.uid && <>
                       <label className="visually-hidden" htmlFor={`role-${record.id}`}>Change role for {String(record.displayName ?? record.email)}</label>
                       <select className="role-select" id={`role-${record.id}`} value={String(record.role)} disabled={rowPending === record.id} onChange={(event) => {
@@ -492,9 +560,16 @@ export function WorkspaceSection({
                         if (nextStatus !== "active" && !window.confirm(`Suspend ${String(record.displayName ?? record.email)}? They will lose access immediately.`)) return;
                         void patchRecord(record.id, "users", { operation: "set_status", accountStatus: nextStatus });
                       }} disabled={rowPending === record.id}><ShieldAlert size={12} />{record.accountStatus === "active" ? "Suspend" : "Reactivate"}</button>
+                      {record.role === "team_member" && <button className="small-action small-action-danger" type="button" onClick={() => {
+                        setDeleteTarget(record);
+                        setDeleteStage("confirm");
+                        setDeletePassword("");
+                        setDeleteError("");
+                      }} disabled={rowPending === record.id || deletePending} aria-label={`Delete team member ${String(record.displayName ?? record.email)}`}><Trash2 size={12} /> Delete</button>}
                     </>}
                     {collection === "notifications" && !record.readAt && <button className="small-action" type="button" onClick={() => patchRecord(record.id, "notifications", { read: true })} disabled={rowPending === record.id}><Check size={12} />Mark read</button>}
-                    {collection === "clients" && <button className="small-action" type="button" onClick={() => { setEditRecord(record); setFormOpen(true); }}><Building2 size={12} /> Edit</button>}
+                    {collection === "clients" && user.role === "super_admin" && ["pending", "rejected"].includes(String(record.approvalStatus ?? (record.status === "draft" ? "pending" : "approved"))) && <button className="small-action" type="button" onClick={() => setReviewRecord(record)} disabled={rowPending === record.id}><ClipboardCheck size={12} />{record.approvalStatus === "rejected" ? "Review again" : "Review"}</button>}
+                    {collection === "clients" && user.role === "super_admin" && <button className="small-action" type="button" onClick={() => { setEditRecord(record); setFormOpen(true); }}><Building2 size={12} /> Edit</button>}
                   </div></td>}
                 </tr>)}
                 {!pageRecords.length && <tr><td className="empty-table" colSpan={Math.max(currentColumns.length + (hasActionColumn(collection, user) ? 1 : 0), 1)}><span className="empty-icon"><EmptyIcon collection={collection} /></span><h3>{records.length ? "No matching records" : "No records yet"}</h3><p>{records.length ? "Try a different search or status filter." : emptyMessage(collection, section)}</p>{canCreate && !records.length && <button className="button button-secondary" type="button" onClick={() => setFormOpen(true)}><Plus size={14} /> Create your first record</button>}</td></tr>}
@@ -519,8 +594,8 @@ export function WorkspaceSection({
             ...(user.role === "super_admin" ? [{ name: "assignedCto", label: "Assigned CTO", type: "select" as const, required: true, options: fieldOptions(auxiliary.users.filter((record) => record.role === "cto" && record.accountStatus === "active"), "id", "displayName") }] : []),
             { name: "assignedTeam", label: "Assigned team members", type: "select", multiple: true, options: fieldOptions(auxiliary.users.filter((record) => record.role === "team_member" && record.accountStatus === "active"), "id", "displayName") },
           ] : fields}
-          title={editRecord ? collection === "workReports" ? "Revise work report" : collection === "projectRequests" ? "Revise project request" : collection === "projects" ? "Update project delivery" : "Edit client" : collection === "users" ? "Invite a workspace user" : `Create ${section.replaceAll("-", " ").replace(/s$/, "")}`}
-          description={editRecord ? collection === "workReports" ? "Your previous report version will remain in the revision history." : collection === "projectRequests" ? "Your previous submission will remain in the revision history." : collection === "projects" ? "Update project delivery, commercial terms, and team. Changes are audited." : "Changes are saved with an audit record." : collection === "users" ? "The new team member receives a secure password setup link." : collection === "projectRequests" ? "Save a draft for later or submit the request to the CTO for review." : "Complete the required details. Record access is checked again on the server."}
+          title={editRecord ? collection === "workReports" ? "Revise work report" : collection === "projectRequests" ? "Revise project request" : collection === "projects" ? "Update project delivery" : "Edit client" : collection === "users" ? "Create a workspace user" : `Create ${section.replaceAll("-", " ").replace(/s$/, "")}`}
+          description={editRecord ? collection === "workReports" ? "Your previous report version will remain in the revision history." : collection === "projectRequests" ? "Your previous submission will remain in the revision history." : collection === "projects" ? "Update project delivery, commercial terms, and team. Changes are audited." : "Changes are saved with an audit record." : collection === "users" ? "Set a unique user ID, login email, role, and initial password." : collection === "clients" && user.role !== "super_admin" ? "New client submissions stay pending until a Super Admin approves them." : collection === "projectRequests" ? "Save a draft for later or submit the request to the CTO for review." : "Complete the required details. Record access is checked again on the server."}
           endpoint={editRecord ? `/api/records/${collection}/${editRecord.id}` : `/api/records/${collection}`}
           method={editRecord ? "PATCH" : "POST"}
           extraPayload={editRecord && collection === "workReports" ? { operation: "revise" } : editRecord && collection === "projectRequests" ? { action: "revise" } : undefined}
@@ -529,32 +604,59 @@ export function WorkspaceSection({
           onSuccess={formSucceeded}
         />
       )}
-      {reviewRecord && collection && <ReviewDialog collection={collection} record={reviewRecord} onClose={() => setReviewRecord(null)} onComplete={() => { setReviewRecord(null); router.refresh(); }} />}
+      {reviewRecord && collection && <ReviewDialog collection={collection} record={reviewRecord} users={auxiliary.users} onClose={() => setReviewRecord(null)} onComplete={() => { setReviewRecord(null); router.refresh(); }} />}
+      {deleteTarget && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDeleteDialog(); }}>
+        <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="delete-user-title">
+          <header className="modal-header">
+            <div>
+              <h2 id="delete-user-title">{deleteStage === "confirm" ? "Delete team member?" : "Confirm with your password"}</h2>
+              <p>{String(deleteTarget.displayName ?? deleteTarget.email ?? "Team member")}</p>
+            </div>
+            <button className="icon-button" type="button" onClick={closeDeleteDialog} aria-label="Close delete dialog" disabled={deletePending}><X size={17} /></button>
+          </header>
+          <form className="review-form" onSubmit={(event) => { event.preventDefault(); void confirmTeamMemberDelete(); }}>
+            {deleteStage === "confirm" ? (
+              <p className="delete-confirm-copy">This permanently removes the account and stops access immediately. Existing project and work-report history will remain in the workspace.</p>
+            ) : <>
+              <label className="field-label" htmlFor="delete-user-password">Super Admin password</label>
+              <input className="text-input" id="delete-user-password" type="password" value={deletePassword} onChange={(event) => setDeletePassword(event.target.value)} autoComplete="current-password" required maxLength={128} aria-describedby="delete-user-password-help" />
+              <p className="form-helper delete-password-help" id="delete-user-password-help">Password checks are limited to five attempts per hour.</p>
+            </>}
+            {deleteError && <div className="form-error-inline" role="alert">{deleteError}</div>}
+            <div className="form-actions">
+              <button className="button button-secondary" type="button" onClick={closeDeleteDialog} disabled={deletePending}>Cancel</button>
+              <button className="button button-danger" type="submit" disabled={deletePending || deleteStage === "password" && !deletePassword}>
+                {deletePending ? "Deleting…" : deleteStage === "confirm" ? "Continue" : "Delete account"}
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>}
     </>
   );
 }
 
 function hasActionColumn(collection: CollectionName | null, user: SessionUser) {
-  if (collection === "projects") return user.role === "super_admin" || user.role === "cto";
+  if (collection === "projects") return user.role === "super_admin";
   if (collection === "milestones") return user.role === "super_admin" || user.role === "cto";
   if (collection === "projectRequests") return user.role === "super_admin" || user.role === "cto" || user.role === "product_manager";
   if (collection === "workReports") return user.role !== "product_manager";
   if (collection === "tasks") return true;
   if (collection === "users") return user.role === "super_admin";
   if (collection === "notifications") return true;
-  if (collection === "clients") return user.role === "super_admin" || user.role === "product_manager";
+  if (collection === "clients") return user.role === "super_admin";
   return false;
 }
 
 function hasActions(collection: CollectionName, user: SessionUser, record: RecordData) {
-  if (collection === "projects") return user.role === "super_admin" || user.role === "cto";
+  if (collection === "projects") return user.role === "super_admin";
   if (collection === "milestones") return (user.role === "super_admin" || user.role === "cto") && record.status !== "completed";
   if (collection === "projectRequests") return (user.role === "super_admin" || user.role === "cto") && ["pending_cto_review", "changes_requested"].includes(String(record.status)) || user.role === "product_manager" && ["changes_requested", "draft"].includes(String(record.status));
   if (collection === "workReports") return (user.role === "super_admin" || user.role === "cto") && ["submitted", "under_review"].includes(String(record.status)) || user.role === "team_member" && record.status === "changes_requested";
   if (collection === "tasks") return user.role === "team_member" && record.status !== "completed" || user.role === "super_admin" || user.role === "cto";
   if (collection === "users") return user.role === "super_admin" && record.uid !== user.uid;
   if (collection === "notifications") return user.role === "super_admin" || user.role === "cto" || user.role === "product_manager" || user.role === "team_member";
-  if (collection === "clients") return user.role === "super_admin" || user.role === "product_manager";
+  if (collection === "clients") return user.role === "super_admin";
   return false;
 }
 

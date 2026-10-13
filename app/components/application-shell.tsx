@@ -5,9 +5,9 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
 import {
-  Bell, Building2, ChartNoAxesCombined, ClipboardCheck, ClipboardList,
+  Bell, Building2, ChartNoAxesCombined, ClipboardCheck,
   FileClock, FolderKanban, LayoutDashboard, ListTodo, LogOut, Menu,
-  MessageSquareText, Settings, Users, UsersRound, X,
+  Settings, Users, X,
   type LucideIcon,
 } from "lucide-react";
 import { BrandWordmark } from "@/app/components/auth-layout";
@@ -28,30 +28,16 @@ const navigation: Record<Role, NavLink[]> = {
     { label: "Settings", href: "/admin/settings", icon: Settings },
   ],
   cto: [
-    { label: "Dashboard", href: "/cto/dashboard", icon: LayoutDashboard },
     { label: "Clients", href: "/cto/clients", icon: Building2 },
-    { label: "Project requests", href: "/cto/project-requests", icon: ClipboardList },
     { label: "Projects", href: "/cto/projects", icon: FolderKanban },
-    { label: "Team", href: "/cto/team", icon: UsersRound },
-    { label: "Tasks", href: "/cto/tasks", icon: ListTodo },
-    { label: "Work reports", href: "/cto/reports", icon: ClipboardCheck },
-    { label: "Milestones", href: "/cto/milestones", icon: FileClock },
-    { label: "Notifications", href: "/cto/notifications", icon: Bell },
   ],
   product_manager: [
-    { label: "Dashboard", href: "/product-manager/dashboard", icon: LayoutDashboard },
     { label: "Clients", href: "/product-manager/clients", icon: Building2 },
-    { label: "Project requests", href: "/product-manager/project-requests", icon: ClipboardList },
     { label: "Projects", href: "/product-manager/projects", icon: FolderKanban },
-    { label: "Updates", href: "/product-manager/updates", icon: MessageSquareText },
   ],
   team_member: [
-    { label: "Dashboard", href: "/workspace/dashboard", icon: LayoutDashboard },
     { label: "My projects", href: "/workspace/projects", icon: FolderKanban },
-    { label: "My tasks", href: "/workspace/tasks", icon: ListTodo },
-    { label: "Daily reports", href: "/workspace/daily-reports", icon: ClipboardCheck },
-    { label: "Work history", href: "/workspace/history", icon: FileClock },
-    { label: "Notifications", href: "/workspace/notifications", icon: Bell },
+    { label: "Clients", href: "/workspace/clients", icon: Building2 },
   ],
 };
 
@@ -123,6 +109,7 @@ export function ApplicationShell({
           <div className="profile-copy">
             <div className="profile-name" title={user.displayName}>{user.displayName}</div>
             <div className="profile-role">{user.designation || roleLabel[user.role]}</div>
+            <div className="profile-id" title={`User ID: ${user.uid}`}>ID: {user.uid}</div>
           </div>
           <button className="signout-button" type="button" onClick={logout} disabled={signingOut} title="Sign out" aria-label="Sign out">
             <LogOut size={15} />
@@ -141,10 +128,10 @@ export function ApplicationShell({
           </div>
           <div className="topbar-right">
             <span className="topbar-date">BUSISERVE WORKSPACE</span>
-            <Link className="topbar-icon" href={user.role === "product_manager" ? "/product-manager/updates" : user.role === "super_admin" ? "/admin/notifications" : user.role === "cto" ? "/cto/notifications" : "/workspace/notifications"} aria-label="Notifications and account updates">
+            {user.role === "super_admin" && <Link className="topbar-icon" href="/admin/notifications" aria-label="Notifications and account updates">
               <Bell size={16} strokeWidth={1.8} />
               {unreadCount > 0 && <span className="notification-dot" />}
-            </Link>
+            </Link>}
           </div>
         </header>
         <div className="workspace-content">

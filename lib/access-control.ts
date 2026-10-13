@@ -14,11 +14,7 @@ export function canAccessArea(role: string, area: string) {
 
 export function canReadCollection(role: AccessRole, collection: string) {
   if (role === "super_admin") return true;
-  if (collection === "clients") return role === "cto" || role === "product_manager";
-  if (collection === "projectRequests") return role === "cto" || role === "product_manager";
-  if (["projects", "tasks", "milestones", "workReports", "notifications"].includes(collection)) return true;
-  if (collection === "users" || collection === "auditLogs") return role === "cto";
-  return false;
+  return collection === "clients" || collection === "projects";
 }
 
 export function canReadRecord(
@@ -26,25 +22,29 @@ export function canReadRecord(
   uid: string,
   collection: string,
   record: Record<string, unknown>,
-  scopedProjectIds?: ReadonlySet<string>,
+  _scopedProjectIds?: ReadonlySet<string>,
 ) {
   if (role === "super_admin") return true;
-  if (collection === "clients") return role === "cto" || role === "product_manager" && (record.createdBy === uid || record.assignedProductManager === uid);
-  if (collection === "projectRequests") return role === "cto" && record.status !== "draft" || role === "product_manager" && (record.createdBy === uid || record.assignedProductManager === uid);
+  if (collection === "clients") {
+    if (role === "cto") return record.createdBy === uid;
+    if (role === "product_manager") return record.createdBy === uid || record.assignedProductManager === uid;
+    return record.createdBy === uid;
+  }
   if (collection === "projects") {
     if (role === "cto") return record.assignedCto === uid;
     if (role === "product_manager") return record.assignedProductManager === uid;
     return Array.isArray(record.assignedTeam) && record.assignedTeam.includes(uid);
   }
+  if (collection === "projectRequests") return role === "cto" && record.status !== "draft" || role === "product_manager" && (record.createdBy === uid || record.assignedProductManager === uid);
   if (collection === "tasks") {
-    if (role === "team_member") return record.assigneeId === uid && Boolean(scopedProjectIds?.has(String(record.projectId)));
-    return Boolean(scopedProjectIds?.has(String(record.projectId)));
+    if (role === "team_member") return record.assigneeId === uid && Boolean(_scopedProjectIds?.has(String(record.projectId)));
+    return Boolean(_scopedProjectIds?.has(String(record.projectId)));
   }
   if (collection === "workReports") {
     if (role === "team_member") return record.employeeId === uid;
-    return Boolean(scopedProjectIds?.has(String(record.projectId)));
+    return Boolean(_scopedProjectIds?.has(String(record.projectId)));
   }
-  if (collection === "milestones") return Boolean(scopedProjectIds?.has(String(record.projectId)));
+  if (collection === "milestones") return Boolean(_scopedProjectIds?.has(String(record.projectId)));
   if (collection === "notifications") return record.recipientUid === uid;
   if (collection === "auditLogs") return role === "cto" && record.actorUid === uid;
   if (collection === "users") return role === "cto" && record.role === "team_member";
@@ -52,5 +52,5 @@ export function canReadRecord(
 }
 
 export function isPrivilegedRole(role: AccessRole) {
-  return role === "super_admin" || role === "cto";
+  return role === "super_admin";
 }

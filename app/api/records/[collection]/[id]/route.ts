@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { z } from "zod";
-import { adminAuth, adminDb } from "@/lib/firebase-admin";
+import { adminAuth, adminDb, hasAuthApiKey } from "@/lib/firebase-admin";
 import { requireSessionUser } from "@/lib/auth";
-import { addAuditToBatch, createNotification, getRecord, listRecords, notifyRole } from "@/lib/data";
+import { addAuditToBatch, auditEntry, createNotification, getRecord, listRecords, notifyRole } from "@/lib/data";
 import { assertSameOrigin, errorResponse, HttpError, parseBody, serializeRecord } from "@/lib/http";
+import { consumeRateLimit } from "@/lib/security";
 import type { CollectionName } from "@/lib/types";
 
 const collections: CollectionName[] = ["clients", "projects", "projectRequests", "tasks", "milestones", "workReports", "notifications", "auditLogs", "users"];
@@ -60,10 +61,20 @@ const clientUpdateSchema = z.object({
   internalNotes: z.string().trim().max(5000).optional(),
   assignedProductManager: z.string().trim().min(1).optional(),
 });
+const clientReviewSchema = z.object({
+  operation: z.literal("review"),
+  action: z.enum(["approve", "reject"]),
+  assignedProductManager: z.string().trim().optional(),
+  reviewerComments: z.string().trim().max(4000).optional().default(""),
+});
 const userUpdateSchema = z.object({
   operation: z.enum(["set_status", "change_role"]),
   accountStatus: z.enum(["active", "suspended"]).optional(),
   role: z.enum(["super_admin", "cto", "product_manager", "team_member"]).optional(),
+});
+const userDeleteSchema = z.object({
+  operation: z.literal("delete"),
+  password: z.string().min(1).max(128),
 });
 const notificationUpdateSchema = z.object({ read: z.boolean() });
 const milestoneUpdateSchema = z.object({ status: z.enum(["planned", "in_progress", "blocked", "completed"]) });
@@ -82,6 +93,11 @@ const projectRequestRevisionSchema = z.object({
 function ensureCollection(value: string): CollectionName {
   if (!collections.includes(value as CollectionName)) throw new HttpError("Record type not found.", 404);
   return value as CollectionName;
+}
+
+function isReviewableClient(client: FirebaseFirestore.DocumentData) {
+  return client.approvalStatus === "pending" || client.approvalStatus === "rejected"
+    || client.approvalStatus === undefined && client.status === "draft";
 }
 
 async function reviewRequest(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
@@ -370,6 +386,8 @@ async function updateClient(id: string, request: Request, user: Awaited<ReturnTy
   if (!current.exists) throw new HttpError("Client not found.", 404);
   if (user.role === "product_manager" && current.data()?.createdBy !== user.uid && current.data()?.assignedProductManager !== user.uid) throw new HttpError("You cannot edit this client.", 403);
   if (user.role === "product_manager" && input.assignedProductManager !== undefined) throw new HttpError("You cannot reassign this client.", 403);
+  if (user.role !== "super_admin" && input.status !== undefined) throw new HttpError("Only a Super Admin can change client status.", 403);
+  if (user.role !== "super_admin" && input.internalNotes !== undefined) throw new HttpError("Only a Super Admin can edit internal notes.", 403);
   if (input.assignedProductManager) {
     const manager = await db.collection("users").doc(input.assignedProductManager).get();
     if (!manager.exists || manager.data()?.role !== "product_manager" || manager.data()?.accountStatus !== "active") {
@@ -389,6 +407,64 @@ async function updateClient(id: string, request: Request, user: Awaited<ReturnTy
   return { id, ...changes };
 }
 
+async function reviewClient(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
+  if (user.role !== "super_admin") throw new HttpError("Only a Super Admin can approve client records.", 403);
+  const input = await parseBody(request, clientReviewSchema);
+  const db = adminDb();
+  const ref = db.collection("clients").doc(id);
+  const snapshot = await ref.get();
+  if (!snapshot.exists) throw new HttpError("Client not found.", 404);
+  const current = snapshot.data()!;
+  if (!isReviewableClient(current)) throw new HttpError("This client is no longer awaiting approval.", 409);
+
+  let assignedProductManager = "";
+  if (input.action === "approve" && input.assignedProductManager) {
+    const manager = await db.collection("users").doc(input.assignedProductManager).get();
+    if (!manager.exists || manager.data()?.role !== "product_manager" || manager.data()?.accountStatus !== "active") {
+      throw new HttpError("Choose an active Product Manager for this client.", 400);
+    }
+    assignedProductManager = input.assignedProductManager;
+  }
+
+  const changes = {
+    approvalStatus: input.action === "approve" ? "approved" : "rejected",
+    approvalComments: input.reviewerComments,
+    reviewedBy: user.uid,
+    reviewedAt: FieldValue.serverTimestamp(),
+    ...(input.action === "approve" ? { ...(assignedProductManager ? { assignedProductManager } : {}), status: "active" } : {}),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  const auditRef = db.collection("auditLogs").doc();
+  await db.runTransaction(async (transaction) => {
+    const latest = await transaction.get(ref);
+    if (!latest.exists) throw new HttpError("Client not found.", 404);
+    if (!latest.data() || !isReviewableClient(latest.data()!)) throw new HttpError("This client is no longer awaiting approval.", 409);
+    transaction.update(ref, changes);
+    transaction.set(auditRef, auditEntry(user, input.action === "approve" ? "client_approved" : "client_rejected", "clients", id, {
+      clientName: String(current.clientName ?? ""),
+      ...(input.action === "approve" ? { assignedProductManager } : {}),
+      ...(input.reviewerComments ? { reviewerComments: input.reviewerComments } : {}),
+    }));
+  });
+
+  const creator = String(current.createdBy ?? "");
+  if (creator) {
+    const profile = await db.collection("users").doc(creator).get();
+    const role = profile.data()?.role;
+    const href = role === "product_manager" ? "/product-manager/clients" : role === "cto" ? "/cto/clients" : "/workspace/clients";
+    void createNotification(
+      creator,
+      input.action === "approve" ? "Client approved" : "Client submission reviewed",
+      input.action === "approve"
+        ? `${String(current.clientName ?? "Your client") } is approved and ready to use.`
+        : `${String(current.clientName ?? "Your client")} was not approved.${input.reviewerComments ? ` ${input.reviewerComments}` : ""}`,
+      href,
+      input.action === "approve" ? "client_approved" : "client_rejected",
+    ).catch(() => undefined);
+  }
+  return { id, ...changes };
+}
+
 async function updateUser(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
   if (user.role !== "super_admin") throw new HttpError("Only a Super Admin can manage accounts.", 403);
   if (id === user.uid) throw new HttpError("You cannot change your own role or account status.", 403);
@@ -398,6 +474,7 @@ async function updateUser(id: string, request: Request, user: Awaited<ReturnType
   const snapshot = await ref.get();
   if (!snapshot.exists) throw new HttpError("User not found.", 404);
   const current = snapshot.data()!;
+  if (current.deletionPending) throw new HttpError("This account is being deleted. Retry the delete action to finish.", 409);
   if (input.operation === "set_status" && !input.accountStatus) throw new HttpError("Choose an account status.", 400);
   if (input.operation === "change_role" && !input.role) throw new HttpError("Choose a role.", 400);
   const nextRole = input.role ?? current.role;
@@ -415,12 +492,131 @@ async function updateUser(id: string, request: Request, user: Awaited<ReturnType
   return { id, role: nextRole, accountStatus: nextStatus };
 }
 
+async function verifySuperAdminPassword(password: string, user: Awaited<ReturnType<typeof requireSessionUser>>) {
+  if (!hasAuthApiKey()) throw new HttpError("Firebase Authentication is not configured for password verification.", 503);
+
+  const attempt = await consumeRateLimit(`user-deletion-password:${user.uid}`, 5, 60 * 60 * 1000);
+  if (!attempt.allowed) throw new HttpError("Too many password attempts. Try again in one hour.", 429);
+
+  const authUser = await adminAuth().getUser(user.uid);
+  if (!authUser.email) throw new HttpError("The Super Admin account does not have a sign-in email.", 400);
+  let response: Response;
+  try {
+    response = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(process.env.FIREBASE_API_KEY!)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: authUser.email, password, returnSecureToken: true }),
+        cache: "no-store",
+      },
+    );
+  } catch {
+    throw new HttpError("Password verification is temporarily unavailable. Try again.", 503);
+  }
+
+  let localId = "";
+  let authError = "";
+  try {
+    const result = await response.json() as { localId?: string; error?: { message?: string } };
+    localId = String(result.localId ?? "");
+    authError = String(result.error?.message ?? "");
+  } catch {
+    throw new HttpError("Password verification is temporarily unavailable. Try again.", 503);
+  }
+  if (response.ok && localId === user.uid) return;
+
+  if (["INVALID_PASSWORD", "INVALID_LOGIN_CREDENTIALS", "EMAIL_NOT_FOUND"].includes(authError)) {
+    const remaining = attempt.remaining;
+    const message = remaining === 0
+      ? "Incorrect Super Admin password. The limit is reached; try again in one hour."
+      : `Incorrect Super Admin password. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining this hour.`;
+    throw new HttpError(message, 401);
+  }
+  if (authError === "TOO_MANY_ATTEMPTS_TRY_LATER") {
+    throw new HttpError("Firebase temporarily blocked password checks. Try again later.", 429);
+  }
+  throw new HttpError("Password verification could not be completed. Try again.", 503);
+}
+
+async function deleteTeamMember(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
+  if (user.role !== "super_admin") throw new HttpError("Only a Super Admin can delete team members.", 403);
+  if (id === user.uid) throw new HttpError("You cannot delete your own account.", 403);
+  const input = await parseBody(request, userDeleteSchema);
+  const db = adminDb();
+  const profileRef = db.collection("users").doc(id);
+  const initialProfile = await profileRef.get();
+  if (!initialProfile.exists) throw new HttpError("Team member not found.", 404);
+  if (initialProfile.data()?.role !== "team_member") throw new HttpError("Only a team member account can be deleted here.", 403);
+
+  await verifySuperAdminPassword(input.password, user);
+
+  const existingStatus = String(initialProfile.data()?.accountStatus ?? "active");
+  const wasAlreadyPending = Boolean(initialProfile.data()?.deletionPending);
+  if (wasAlreadyPending && existingStatus !== "suspended") {
+    throw new HttpError("This account has an invalid deletion state. Contact support.", 409);
+  }
+  await db.runTransaction(async (transaction) => {
+    const latest = await transaction.get(profileRef);
+    if (!latest.exists) throw new HttpError("Team member not found.", 404);
+    if (latest.data()?.role !== "team_member") throw new HttpError("Only a team member account can be deleted here.", 403);
+    if (latest.data()?.deletionPending && !wasAlreadyPending) throw new HttpError("This account is already being deleted. Retry the delete action shortly.", 409);
+    if (!latest.data()?.deletionPending) {
+      transaction.update(profileRef, {
+        accountStatus: "suspended",
+        deletionPending: true,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }
+  });
+
+  try {
+    await adminAuth().deleteUser(id);
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+    if (code !== "auth/user-not-found") {
+      if (!wasAlreadyPending) {
+        await profileRef.update({
+          accountStatus: existingStatus,
+          deletionPending: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        }).catch(() => undefined);
+      }
+      throw new HttpError("The team member account could not be deleted. Try again.", 503);
+    }
+  }
+
+  const retiredIdRef = db.collection("deletedUserIds").doc(id);
+  const auditRef = db.collection("auditLogs").doc();
+  await db.runTransaction(async (transaction) => {
+    const latest = await transaction.get(profileRef);
+    if (!latest.exists) throw new HttpError("Team member not found.", 404);
+    if (latest.data()?.role !== "team_member" || !latest.data()?.deletionPending) {
+      throw new HttpError("The account changed while it was being deleted. Refresh and try again.", 409);
+    }
+    transaction.delete(profileRef);
+    transaction.set(retiredIdRef, {
+      deletedAt: FieldValue.serverTimestamp(),
+      deletedBy: user.uid,
+    });
+    transaction.set(auditRef, auditEntry(user, "user_deleted", "users", id, {
+      role: "team_member",
+      displayName: String(latest.data()?.displayName ?? ""),
+      email: String(latest.data()?.email ?? ""),
+    }));
+  });
+  return { id, deleted: true };
+}
+
 export async function PATCH(request: Request, context: { params: Promise<{ collection: string; id: string }> }) {
   try {
     assertSameOrigin(request);
     const user = await requireSessionUser();
     const { collection: rawCollection, id } = await context.params;
     const collection = ensureCollection(rawCollection);
+    if (user.role !== "super_admin") {
+      throw new HttpError("Only a Super Admin can update workspace records.", 403);
+    }
     let result;
     if (collection === "projectRequests") {
       const operation = (await parseBody(request.clone(), z.object({ action: z.string().optional() }))).action;
@@ -432,8 +628,14 @@ export async function PATCH(request: Request, context: { params: Promise<{ colle
     else if (collection === "tasks") result = await updateTask(id, request, user);
     else if (collection === "projects") result = await updateProject(id, request, user);
     else if (collection === "milestones") result = await updateMilestone(id, request, user);
-    else if (collection === "clients") result = await updateClient(id, request, user);
-    else if (collection === "users") result = await updateUser(id, request, user);
+    else if (collection === "clients") {
+      const operation = (await parseBody(request.clone(), z.object({ operation: z.string().optional() }))).operation;
+      result = operation === "review" ? await reviewClient(id, request, user) : await updateClient(id, request, user);
+    }
+    else if (collection === "users") {
+      const operation = (await parseBody(request.clone(), z.object({ operation: z.string().optional() }))).operation;
+      result = operation === "delete" ? await deleteTeamMember(id, request, user) : await updateUser(id, request, user);
+    }
     else if (collection === "notifications") {
       const input = await parseBody(request, notificationUpdateSchema);
       const record = await getRecord("notifications", id);

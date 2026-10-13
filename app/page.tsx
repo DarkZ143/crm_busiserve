@@ -8,9 +8,9 @@ import type { Role } from "@/lib/types";
 
 const homeByRole: Record<Role, string> = {
   super_admin: "/admin/dashboard",
-  cto: "/cto/dashboard",
-  product_manager: "/product-manager/dashboard",
-  team_member: "/workspace/dashboard",
+  cto: "/cto/projects",
+  product_manager: "/product-manager/projects",
+  team_member: "/workspace/projects",
 };
 
 export default function HomePage() {
