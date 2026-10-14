@@ -5,9 +5,9 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
 import {
-  Bell, Building2, ChartNoAxesCombined, ClipboardCheck,
+  Bell, Building2, ChartNoAxesCombined, ClipboardCheck, GraduationCap,
   FileClock, FolderKanban, LayoutDashboard, ListTodo, LogOut, Menu,
-  Settings, Users, X,
+  Settings, UserRound, Users, UsersRound, X,
   type LucideIcon,
 } from "lucide-react";
 import { BrandWordmark } from "@/app/components/auth-layout";
@@ -18,6 +18,9 @@ const navigation: Record<Role, NavLink[]> = {
   super_admin: [
     { label: "Dashboard", href: "/admin/dashboard", icon: LayoutDashboard },
     { label: "User management", href: "/admin/users", icon: Users },
+    { label: "Interns", href: "/admin/interns", icon: GraduationCap },
+    { label: "Full-time employees", href: "/admin/employees", icon: UserRound },
+    { label: "Team Management", href: "/admin/teams", icon: UsersRound },
     { label: "Clients", href: "/admin/clients", icon: Building2 },
     { label: "Projects", href: "/admin/projects", icon: FolderKanban },
     { label: "Tasks", href: "/admin/tasks", icon: ListTodo },
@@ -37,7 +40,8 @@ const navigation: Record<Role, NavLink[]> = {
   ],
   team_member: [
     { label: "My projects", href: "/workspace/projects", icon: FolderKanban },
-    { label: "Clients", href: "/workspace/clients", icon: Building2 },
+    { label: "Work report", href: "/workspace/daily-reports", icon: ClipboardCheck },
+    { label: "Settings", href: "/workspace/settings", icon: Settings },
   ],
 };
 

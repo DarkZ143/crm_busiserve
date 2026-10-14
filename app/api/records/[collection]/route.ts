@@ -3,21 +3,31 @@ import { FieldValue } from "firebase-admin/firestore";
 import { z } from "zod";
 import { adminAuth, adminDb } from "@/lib/firebase-admin";
 import { requireSessionUser } from "@/lib/auth";
+import { canReadCollection } from "@/lib/access-control";
 import { addAuditToBatch, auditEntry, createNotification, listRecords, notifyRole } from "@/lib/data";
 import { redactRecordForRole } from "@/lib/record-security";
+import { canReadRecord } from "@/lib/access-control";
+import { teamMemberSummary } from "@/lib/project-approval";
+import { assertTeamsExist, createIntern, createTeam, setProjectTeams } from "@/lib/interns-teams";
+import { syncProjectAssignments } from "@/lib/assignments";
 import { assertSameOrigin, errorResponse, HttpError, parseBody, serializeRecord } from "@/lib/http";
 import type { CollectionName } from "@/lib/types";
 
-const collectionNames: CollectionName[] = ["clients", "projects", "projectRequests", "tasks", "milestones", "workReports", "notifications", "auditLogs", "users"];
+const collectionNames: CollectionName[] = ["clients", "projects", "projectRequests", "tasks", "milestones", "workReports", "notifications", "auditLogs", "users", "interns", "teams"];
 const roles = ["super_admin", "cto", "product_manager", "team_member"] as const;
 
 const clientSchema = z.object({
+  // Required: client name, contact number, project name, and business address. Everything else is optional.
   clientName: z.string().trim().min(2).max(160),
-  contactPerson: z.string().trim().min(2).max(120),
-  officialEmail: z.email().max(254).transform((value) => value.trim().toLowerCase()),
   contactNumber: z.string().trim().min(7).max(24),
+  projectName: z.string().trim().min(2).max(160),
+  businessAddress: z.string().trim().min(3).max(500),
+  contactPerson: z.string().trim().max(120).optional().default(""),
+  officialEmail: z.preprocess(
+    (value) => typeof value === "string" && !value.trim() ? undefined : value,
+    z.email().max(254).transform((value) => value.trim().toLowerCase()).optional(),
+  ).transform((value) => value ?? ""),
   companyName: z.string().trim().max(160).optional().default(""),
-  businessAddress: z.string().trim().max(500).optional().default(""),
   industry: z.string().trim().max(100).optional().default(""),
   requirements: z.string().trim().max(5000).optional().default(""),
   objectives: z.string().trim().max(3000).optional().default(""),
@@ -63,6 +73,25 @@ const projectSchema = z.object({
   status: z.enum(["planning", "in_progress", "on_hold", "blocked", "in_review"]).optional().default("planning"),
   assignedCto: z.string().optional(),
   assignedTeam: idList.optional().default([]),
+  teamIds: idList.optional().default([]),
+}).refine((record) => !record.startDate || !record.expectedEndDate || record.expectedEndDate >= record.startDate, {
+  message: "Expected end date must be after the start date.",
+  path: ["expectedEndDate"],
+});
+
+// What a non-admin can define when proposing a project. Team, CTO, and commercial terms are set by the Super Admin on review.
+const projectSubmissionSchema = z.object({
+  clientId: z.string().trim().max(128).optional().default(""),
+  name: z.string().trim().min(2).max(160),
+  description: z.string().trim().max(5000).optional().default(""),
+  category: z.string().trim().max(100).optional().default(""),
+  scopeOfWork: z.string().trim().max(8000).optional().default(""),
+  requirements: z.string().trim().max(8000).optional().default(""),
+  deliverables: z.string().trim().max(5000).optional().default(""),
+  startDate: z.string().date().optional(),
+  expectedEndDate: z.string().date().optional(),
+  durationMonths: z.coerce.number().int().min(1).max(120).optional(),
+  priority: z.enum(["low", "normal", "high", "urgent"]).optional().default("normal"),
 }).refine((record) => !record.startDate || !record.expectedEndDate || record.expectedEndDate >= record.startDate, {
   message: "Expected end date must be after the start date.",
   path: ["expectedEndDate"],
@@ -142,8 +171,11 @@ async function createClient(request: Request, user: Awaited<ReturnType<typeof re
     updatedAt: FieldValue.serverTimestamp(),
   };
   await db.runTransaction(async (transaction) => {
-    const duplicate = await transaction.get(db.collection("clients").where("officialEmailNormalized", "==", input.officialEmail).limit(1));
-    if (!duplicate.empty) throw new HttpError("A client already exists with this email address.", 409);
+    // Email is optional, so only check for duplicates when one was given.
+    if (input.officialEmail) {
+      const duplicate = await transaction.get(db.collection("clients").where("officialEmailNormalized", "==", input.officialEmail).limit(1));
+      if (!duplicate.empty) throw new HttpError("A client already exists with this email address.", 409);
+    }
     transaction.set(ref, record);
     transaction.set(auditRef, auditEntry(user, approved ? "client_created" : "client_submitted_for_approval", "clients", ref.id, { clientName: input.clientName }));
   });
@@ -187,7 +219,7 @@ async function createProjectRequest(request: Request, user: Awaited<ReturnType<t
 
 async function createProject(request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
   if (user.role !== "super_admin" && user.role !== "cto") throw new HttpError("You cannot create projects.", 403);
-  const input = await parseBody(request, projectSchema);
+  const { teamIds, ...input } = await parseBody(request, projectSchema);
   const db = adminDb();
   const [client, members] = await Promise.all([
     db.collection("clients").doc(input.clientId).get(),
@@ -204,15 +236,30 @@ async function createProject(request: Request, user: Awaited<ReturnType<typeof r
     const cto = await db.collection("users").doc(assignedCto).get();
     if (!cto.exists || cto.data()?.role !== "cto" || cto.data()?.accountStatus !== "active") throw new HttpError("Choose an active CTO.", 400);
   }
+  await assertTeamsExist(teamIds);
   const ref = db.collection("projects").doc();
+  const assignedCtoName = assignedCto === user.uid ? user.displayName : assignedCto ? String((await db.collection("users").doc(assignedCto).get()).data()?.displayName ?? "") : "";
   const record = {
     ...input,
     id: ref.id,
     projectId: `PRJ-${ref.id.slice(0, 8).toUpperCase()}`,
+    clientName: String(client.data()?.clientName ?? ""),
     assignedCto,
+    assignedCtoName,
     assignedProductManager: client.data()?.assignedProductManager ?? "",
     assignedTeam: input.assignedTeam,
+    directAssignedTeam: input.assignedTeam,
+    assignedTeamMembers: members.map((member) => teamMemberSummary(member.id, member.data())),
+    assignedTeams: [] as { id: string; name: string }[],
+    assignedInterns: [] as { id: string; internId: string; fullName: string; role: string }[],
+    approvalStatus: "approved",
+    approvalComments: "",
+    reviewedBy: user.uid,
+    reviewedByName: user.displayName,
+    reviewedAt: FieldValue.serverTimestamp(),
     createdBy: user.uid,
+    createdByName: user.displayName,
+    createdByRole: user.role,
     progressPercentage: 0,
     actualCompletionDate: null,
     createdAt: FieldValue.serverTimestamp(),
@@ -240,7 +287,60 @@ async function createProject(request: Request, user: Awaited<ReturnType<typeof r
   for (const uid of input.assignedTeam) {
     void createNotification(uid, "New project assignment", `You have been assigned to ${input.name}.`, "/workspace/projects", "project_assignment").catch(() => undefined);
   }
+  if (teamIds.length) {
+    // Team members join through the shared recompute, which also notifies them.
+    await setProjectTeams(ref.id, teamIds);
+    await syncProjectAssignments([ref.id]);
+  }
   return redactRecordForRole("projects", { id: ref.id, ...input, assignedCto, assignedTeam: input.assignedTeam, progressPercentage: 0 }, user.role);
+}
+
+async function submitProject(request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
+  if (user.role === "super_admin") throw new HttpError("Super Admins create projects directly.", 400);
+  const input = await parseBody(request, projectSubmissionSchema);
+  const db = adminDb();
+  let clientName = "";
+  let assignedProductManager = user.role === "product_manager" ? user.uid : "";
+  if (input.clientId) {
+    const client = await db.collection("clients").doc(input.clientId).get();
+    if (!client.exists || !canReadRecord(user.role, user.uid, "clients", client.data()!)) throw new HttpError("The selected client was not found.", 404);
+    if (!isClientApproved(client.data()!)) throw new HttpError("This client is awaiting Super Admin approval.", 409);
+    clientName = String(client.data()?.clientName ?? "");
+    // The client's Product Manager (chosen by the Super Admin) owns projects for that client.
+    assignedProductManager = String(client.data()?.assignedProductManager ?? "") || assignedProductManager;
+  }
+  const ref = db.collection("projects").doc();
+  const record = {
+    ...input,
+    id: ref.id,
+    projectId: `PRJ-${ref.id.slice(0, 8).toUpperCase()}`,
+    clientName,
+    status: "pending_approval",
+    approvalStatus: "pending",
+    approvalComments: "",
+    reviewedBy: null,
+    reviewedByName: "",
+    reviewedAt: null,
+    // A CTO who proposes a project is suggested as its lead; the Super Admin can change this on review.
+    assignedCto: user.role === "cto" ? user.uid : "",
+    assignedCtoName: user.role === "cto" ? user.displayName : "",
+    assignedProductManager,
+    assignedTeam: [] as string[],
+    assignedTeamMembers: [] as ReturnType<typeof teamMemberSummary>[],
+    createdBy: user.uid,
+    createdByName: user.displayName,
+    createdByRole: user.role,
+    progressPercentage: 0,
+    actualCompletionDate: null,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  const batch = db.batch();
+  batch.set(ref, record);
+  addAuditToBatch(batch, user, "project_submitted_for_approval", "projects", ref.id, { name: input.name, clientId: input.clientId });
+  await batch.commit();
+  void notifyRole("super_admin", "Project approval needed", `${input.name} was submitted by ${user.displayName}. Review it and assign a team.`, "/admin/projects", "project_submitted").catch(() => undefined);
+  return redactRecordForRole("projects", { ...record, createdAt: null, updatedAt: null }, user.role);
 }
 
 async function createTask(request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
@@ -389,8 +489,8 @@ export async function GET(_request: Request, context: { params: Promise<{ collec
     const user = await requireSessionUser();
     const { collection: rawCollection } = await context.params;
     const collection = ensureCollection(rawCollection);
-    if (user.role !== "super_admin" && collection !== "clients" && collection !== "projects") {
-      throw new HttpError("Only projects and client submissions are available to your role.", 403);
+    if (!canReadCollection(user.role, collection)) {
+      throw new HttpError("This record type is not available to your role.", 403);
     }
     const records = await listRecords(collection, user);
     return NextResponse.json({ records });
@@ -405,17 +505,23 @@ export async function POST(request: Request, context: { params: Promise<{ collec
     const user = await requireSessionUser();
     const { collection: rawCollection } = await context.params;
     const collection = ensureCollection(rawCollection);
-    if (user.role !== "super_admin" && collection !== "clients") {
-      throw new HttpError("You can only submit client records.", 403);
+    const canCreate = user.role === "super_admin"
+      || collection === "projects"
+      || collection === "clients" && user.role !== "team_member"
+      || collection === "workReports" && user.role === "team_member";
+    if (!canCreate) {
+      throw new HttpError("You cannot create this record type.", 403);
     }
     let record;
     if (collection === "clients") record = await createClient(request, user);
     else if (collection === "projectRequests") record = await createProjectRequest(request, user);
-    else if (collection === "projects") record = await createProject(request, user);
+    else if (collection === "projects") record = user.role === "super_admin" ? await createProject(request, user) : await submitProject(request, user);
     else if (collection === "tasks") record = await createTask(request, user);
     else if (collection === "milestones") record = await createMilestone(request, user);
     else if (collection === "workReports") record = await createReport(request, user);
     else if (collection === "users") record = await inviteUser(request, user);
+    else if (collection === "interns") record = await createIntern(request, user);
+    else if (collection === "teams") record = await createTeam(request, user);
     else throw new HttpError("This record type cannot be created here.", 405);
     return NextResponse.json({ record: serializeRecord(record) }, { status: 201 });
   } catch (error) {

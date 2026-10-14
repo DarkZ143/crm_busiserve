@@ -6,9 +6,12 @@ import { requireSessionUser } from "@/lib/auth";
 import { addAuditToBatch, auditEntry, createNotification, getRecord, listRecords, notifyRole } from "@/lib/data";
 import { assertSameOrigin, errorResponse, HttpError, parseBody, serializeRecord } from "@/lib/http";
 import { consumeRateLimit } from "@/lib/security";
+import { directTeamOf, isProjectReviewable, projectsHrefForRole, teamMemberSummary, type ProjectTeamMember } from "@/lib/project-approval";
+import { assertTeamsExist, deleteIntern, deleteTeam, setProjectTeams, updateIntern, updateTeam } from "@/lib/interns-teams";
+import { resyncProjectsForUser, syncProjectAssignments } from "@/lib/assignments";
 import type { CollectionName } from "@/lib/types";
 
-const collections: CollectionName[] = ["clients", "projects", "projectRequests", "tasks", "milestones", "workReports", "notifications", "auditLogs", "users"];
+const collections: CollectionName[] = ["clients", "projects", "projectRequests", "tasks", "milestones", "workReports", "notifications", "auditLogs", "users", "interns", "teams"];
 const requestReviewSchema = z.object({
   action: z.enum(["approve", "request_changes", "reject"]),
   reviewerComments: z.string().trim().max(4000).optional().default(""),
@@ -42,6 +45,7 @@ const projectUpdateSchema = z.object({
   durationMonths: z.coerce.number().int().min(1).max(120).optional(),
   priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
   assignedTeam: z.array(z.string().min(1)).max(50).optional(),
+  teamIds: z.array(z.string().min(1)).max(50).optional(),
   assignedCto: z.string().min(1).optional(),
 }).refine((value) => value.status !== "completed" || value.progressPercentage === 100, {
   message: "Set progress to 100% before completing a project.",
@@ -49,7 +53,8 @@ const projectUpdateSchema = z.object({
 });
 const clientUpdateSchema = z.object({
   clientName: z.string().trim().min(2).max(160).optional(),
-  contactPerson: z.string().trim().min(2).max(120).optional(),
+  contactPerson: z.string().trim().max(120).optional(),
+  projectName: z.string().trim().min(2).max(160).optional(),
   officialEmail: z.email().max(254).transform((value) => value.trim().toLowerCase()).optional(),
   contactNumber: z.string().trim().min(7).max(24).optional(),
   companyName: z.string().trim().max(160).optional(),
@@ -65,6 +70,14 @@ const clientReviewSchema = z.object({
   operation: z.literal("review"),
   action: z.enum(["approve", "reject"]),
   assignedProductManager: z.string().trim().optional(),
+  reviewerComments: z.string().trim().max(4000).optional().default(""),
+});
+const projectReviewSchema = z.object({
+  operation: z.literal("review"),
+  action: z.enum(["approve", "reject"]),
+  assignedTeam: z.array(z.string().trim().min(1)).max(50).optional().default([]),
+  teamIds: z.array(z.string().trim().min(1)).max(50).optional().default([]),
+  assignedCto: z.string().trim().max(128).optional().default(""),
   reviewerComments: z.string().trim().max(4000).optional().default(""),
 });
 const userUpdateSchema = z.object({
@@ -295,26 +308,29 @@ async function updateProject(id: string, request: Request, user: Awaited<ReturnT
   if (!current.exists) throw new HttpError("Project not found.", 404);
   const currentData = current.data()!;
   if (user.role === "cto" && currentData.assignedCto !== user.uid) throw new HttpError("This project is assigned to another CTO.", 403);
+  if (isProjectReviewable(currentData)) throw new HttpError("Review this project submission and assign a team before updating delivery details.", 409);
   const nextStartDate = input.startDate ?? String(currentData.startDate ?? "");
   const nextEndDate = input.expectedEndDate ?? String(currentData.expectedEndDate ?? "");
   if (nextStartDate && nextEndDate && nextEndDate < nextStartDate) throw new HttpError("Expected end date must be on or after the start date.", 400);
   if (user.role === "cto" && input.assignedCto !== undefined) throw new HttpError("Only a Super Admin can reassign a project to another CTO.", 403);
   if (input.assignedTeam) {
-    const members = await Promise.all(input.assignedTeam.map((uid) => db.collection("users").doc(uid).get()));
+    // Only people newly added here must be active. Existing direct members stay even if their account changed since.
+    const previousDirect = directTeamOf(currentData);
+    const added = input.assignedTeam.filter((uid) => !previousDirect.includes(uid));
+    const members = await Promise.all(added.map((uid) => db.collection("users").doc(uid).get()));
     if (members.some((member) => !member.exists || member.data()?.role !== "team_member" || member.data()?.accountStatus !== "active")) {
       throw new HttpError("Choose only active team members for this project.", 400);
     }
   }
+  if (input.teamIds) await assertTeamsExist(input.teamIds);
+  let assignedCtoName: string | undefined;
   if (input.assignedCto) {
     const cto = await db.collection("users").doc(input.assignedCto).get();
     if (!cto.exists || cto.data()?.role !== "cto" || cto.data()?.accountStatus !== "active") {
       throw new HttpError("Choose an active CTO for this project.", 400);
     }
+    assignedCtoName = String(cto.data()?.displayName ?? "");
   }
-  const previousTeam = Array.isArray(currentData.assignedTeam) ? currentData.assignedTeam as string[] : [];
-  const nextTeam = input.assignedTeam ?? previousTeam;
-  const addedMembers = nextTeam.filter((uid) => !previousTeam.includes(uid));
-  const removedMembers = input.assignedTeam === undefined ? [] : previousTeam.filter((uid) => !nextTeam.includes(uid));
   const changes = {
     status: input.status,
     ...(input.progressPercentage !== undefined ? { progressPercentage: input.progressPercentage } : {}),
@@ -324,8 +340,9 @@ async function updateProject(id: string, request: Request, user: Awaited<ReturnT
     ...(input.expectedEndDate !== undefined ? { expectedEndDate: input.expectedEndDate } : {}),
     ...(input.durationMonths !== undefined ? { durationMonths: input.durationMonths } : {}),
     ...(input.priority !== undefined ? { priority: input.priority } : {}),
-    ...(input.assignedTeam !== undefined ? { assignedTeam: input.assignedTeam } : {}),
-    ...(input.assignedCto !== undefined ? { assignedCto: input.assignedCto } : {}),
+    // People chosen one by one. The full assignedTeam, including team members, is recomputed after this write.
+    ...(input.assignedTeam !== undefined ? { directAssignedTeam: input.assignedTeam } : {}),
+    ...(input.assignedCto !== undefined ? { assignedCto: input.assignedCto, assignedCtoName } : {}),
     updatedAt: FieldValue.serverTimestamp(),
     ...(input.status === "completed" && currentData.status !== "completed" ? { actualCompletionDate: new Date().toISOString().slice(0, 10) } : {}),
     ...(input.status !== "completed" && currentData.status === "completed" ? { actualCompletionDate: null } : {}),
@@ -342,15 +359,13 @@ async function updateProject(id: string, request: Request, user: Awaited<ReturnT
     durationMonths: input.durationMonths,
     priority: input.priority,
     ...(input.assignedTeam !== undefined ? { assignedTeam: input.assignedTeam } : {}),
+    ...(input.teamIds !== undefined ? { teamIds: input.teamIds } : {}),
     ...(input.assignedCto !== undefined ? { assignedCto: input.assignedCto } : {}),
   });
   await batch.commit();
-  for (const uid of addedMembers) {
-    void createNotification(uid, "Project assignment", `You have been assigned to ${String(current.data()?.name ?? "a project")}.`, "/workspace/projects", "project_assigned").catch(() => undefined);
-  }
-  for (const uid of removedMembers) {
-    void createNotification(uid, "Project assignment updated", `You are no longer assigned to ${String(currentData.name ?? "a project")}.`, "/workspace/projects", "project_unassigned").catch(() => undefined);
-  }
+  if (input.teamIds !== undefined) await setProjectTeams(id, input.teamIds);
+  // Recomputes membership from direct people plus linked teams and notifies anyone who joined or left.
+  if (input.assignedTeam !== undefined || input.teamIds !== undefined) await syncProjectAssignments([id]);
   const assignedProductManager = String(currentData.assignedProductManager ?? "");
   if (assignedProductManager && (input.status !== currentData.status || input.progressPercentage !== undefined)) {
     void createNotification(assignedProductManager, "Project update", `${String(currentData.name ?? "A project")} status: ${input.status.replaceAll("_", " ")}${input.progressPercentage === undefined ? "" : ` · ${input.progressPercentage}% complete`}.`, "/product-manager/updates", "project_updated").catch(() => undefined);
@@ -359,6 +374,110 @@ async function updateProject(id: string, request: Request, user: Awaited<ReturnT
     void createNotification(input.assignedCto, "Project assigned", `${String(currentData.name ?? "A project")} is now assigned to you.`, "/cto/projects", "project_assigned").catch(() => undefined);
   }
   return { id, status: input.status, progressPercentage: input.progressPercentage, assignedTeam: input.assignedTeam, assignedCto: input.assignedCto };
+}
+
+async function reviewProject(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
+  if (user.role !== "super_admin") throw new HttpError("Only a Super Admin can review project submissions.", 403);
+  const input = await parseBody(request, projectReviewSchema);
+  const db = adminDb();
+  const ref = db.collection("projects").doc(id);
+  const snapshot = await ref.get();
+  if (!snapshot.exists) throw new HttpError("Project not found.", 404);
+  const current = snapshot.data()!;
+  if (!isProjectReviewable(current)) throw new HttpError("This project is no longer awaiting approval.", 409);
+
+  const approve = input.action === "approve";
+  const assignedTeam = [...new Set(input.assignedTeam)];
+  const teamIds = approve ? [...new Set(input.teamIds)] : [];
+  let assignedTeamMembers: ProjectTeamMember[] = [];
+  let teamNames: string[] = [];
+  let assignedCto = String(current.assignedCto ?? "");
+  let assignedCtoName = String(current.assignedCtoName ?? "");
+  if (approve) {
+    if (!assignedTeam.length && !teamIds.length) throw new HttpError("Assign at least one team or team member before approving this project.", 400);
+    teamNames = (await assertTeamsExist(teamIds)).map((team) => String(team.data()?.name ?? "Team"));
+    const members = await Promise.all(assignedTeam.map((uid) => db.collection("users").doc(uid).get()));
+    if (members.some((member) => !member.exists || member.data()?.role !== "team_member" || member.data()?.accountStatus !== "active")) {
+      throw new HttpError("Only active team members can be assigned to a project.", 400);
+    }
+    assignedTeamMembers = members.map((member) => teamMemberSummary(member.id, member.data()));
+    if (input.assignedCto) {
+      const cto = await db.collection("users").doc(input.assignedCto).get();
+      if (!cto.exists || cto.data()?.role !== "cto" || cto.data()?.accountStatus !== "active") throw new HttpError("Choose an active CTO for this project.", 400);
+      assignedCto = input.assignedCto;
+      assignedCtoName = String(cto.data()?.displayName ?? "");
+    }
+  } else if (!input.reviewerComments) {
+    throw new HttpError("Add a comment so the submitter knows why the project was not approved.", 400);
+  }
+
+  const changes = approve
+    ? {
+      approvalStatus: "approved",
+      status: "planning",
+      assignedTeam,
+      directAssignedTeam: assignedTeam,
+      assignedTeamMembers,
+      assignedCto,
+      assignedCtoName,
+      approvalComments: input.reviewerComments,
+      reviewedBy: user.uid,
+      reviewedByName: user.displayName,
+      reviewedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    }
+    : {
+      approvalStatus: "rejected",
+      status: "rejected",
+      approvalComments: input.reviewerComments,
+      reviewedBy: user.uid,
+      reviewedByName: user.displayName,
+      reviewedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+  const auditRef = db.collection("auditLogs").doc();
+  await db.runTransaction(async (transaction) => {
+    const latest = await transaction.get(ref);
+    if (!latest.exists) throw new HttpError("Project not found.", 404);
+    if (!isProjectReviewable(latest.data()!)) throw new HttpError("This project is no longer awaiting approval.", 409);
+    transaction.update(ref, changes);
+    transaction.set(auditRef, auditEntry(user, approve ? "project_approved" : "project_rejected", "projects", id, {
+      name: String(current.name ?? ""),
+      ...(approve ? { assignedTeam, teamIds, assignedCto } : {}),
+      ...(input.reviewerComments ? { reviewerComments: input.reviewerComments } : {}),
+    }));
+  });
+
+  if (teamIds.length) {
+    // Linking teams adds their members through the shared recompute, which notifies them.
+    await setProjectTeams(id, teamIds);
+    await syncProjectAssignments([id]);
+  }
+
+  const projectName = String(current.name ?? "Your project");
+  const creator = String(current.createdBy ?? "");
+  if (creator && creator !== user.uid) {
+    const creatorRole = current.createdByRole ? String(current.createdByRole) : (await db.collection("users").doc(creator).get()).data()?.role;
+    const assignedSummary = [...teamNames.map((name) => `${name} team`), ...assignedTeamMembers.map((member) => member.displayName)].join(", ");
+    void createNotification(
+      creator,
+      approve ? "Project approved" : "Project not approved",
+      approve
+        ? `${projectName} was approved by ${user.displayName}. Assigned: ${assignedSummary}.`
+        : `${projectName} was not approved. ${input.reviewerComments}`,
+      projectsHrefForRole(creatorRole),
+      approve ? "project_approved" : "project_rejected",
+    ).catch(() => undefined);
+  }
+  if (approve) {
+    for (const uid of assignedTeam) {
+      void createNotification(uid, "New project assignment", `You have been assigned to ${projectName}.`, "/workspace/projects", "project_assignment").catch(() => undefined);
+    }
+    if (assignedCto && assignedCto !== creator) {
+      void createNotification(assignedCto, "Project assigned", `${projectName} is now assigned to you.`, "/cto/projects", "project_assigned").catch(() => undefined);
+    }
+  }
+  return { id, ...changes, reviewedAt: null, updatedAt: null };
 }
 
 async function updateMilestone(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
@@ -405,6 +524,30 @@ async function updateClient(id: string, request: Request, user: Awaited<ReturnTy
   addAuditToBatch(batch, user, "client_updated", "clients", id, { changedFields: Object.keys(changes) });
   await batch.commit();
   return { id, ...changes };
+}
+
+async function deleteClient(id: string, user: Awaited<ReturnType<typeof requireSessionUser>>) {
+  if (user.role !== "super_admin") throw new HttpError("Only a Super Admin can delete client records.", 403);
+  const db = adminDb();
+  const ref = db.collection("clients").doc(id);
+  const auditRef = db.collection("auditLogs").doc();
+  await db.runTransaction(async (transaction) => {
+    const [client, projects, requests] = await Promise.all([
+      transaction.get(ref),
+      transaction.get(db.collection("projects").where("clientId", "==", id).limit(1)),
+      transaction.get(db.collection("projectRequests").where("clientId", "==", id).limit(1)),
+    ]);
+    if (!client.exists) throw new HttpError("Client not found.", 404);
+    if (!projects.empty || !requests.empty) {
+      throw new HttpError("This client is linked to a project or project request. Remove those links before deleting the client.", 409);
+    }
+    transaction.delete(ref);
+    transaction.set(auditRef, auditEntry(user, "client_deleted", "clients", id, {
+      clientName: String(client.data()?.clientName ?? ""),
+      companyName: String(client.data()?.companyName ?? ""),
+    }));
+  });
+  return { id, deleted: true };
 }
 
 async function reviewClient(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
@@ -489,6 +632,8 @@ async function updateUser(id: string, request: Request, user: Awaited<ReturnType
   batch.update(ref, { role: nextRole, accountStatus: nextStatus, updatedAt: FieldValue.serverTimestamp() });
   addAuditToBatch(batch, user, input.operation === "change_role" ? "user_role_changed" : "user_account_status_changed", "users", id, { role: nextRole, accountStatus: nextStatus });
   await batch.commit();
+  // Team-based project access depends on being an active team member, so refresh this person's projects.
+  if (nextRole !== current.role || nextStatus !== current.accountStatus) await resyncProjectsForUser(id);
   return { id, role: nextRole, accountStatus: nextStatus };
 }
 
@@ -605,6 +750,8 @@ async function deleteTeamMember(id: string, request: Request, user: Awaited<Retu
       email: String(latest.data()?.email ?? ""),
     }));
   });
+  // Take the deleted account out of its teams and refresh every project it was on.
+  await resyncProjectsForUser(id, { removeFromTeams: true });
   return { id, deleted: true };
 }
 
@@ -626,11 +773,21 @@ export async function PATCH(request: Request, context: { params: Promise<{ colle
     }
     else if (collection === "workReports") result = await updateReport(id, request, user);
     else if (collection === "tasks") result = await updateTask(id, request, user);
-    else if (collection === "projects") result = await updateProject(id, request, user);
+    else if (collection === "projects") {
+      const operation = (await parseBody(request.clone(), z.object({ operation: z.string().optional() }))).operation;
+      result = operation === "review" ? await reviewProject(id, request, user) : await updateProject(id, request, user);
+    }
     else if (collection === "milestones") result = await updateMilestone(id, request, user);
+    else if (collection === "interns" || collection === "teams") {
+      const operation = (await parseBody(request.clone(), z.object({ operation: z.string().optional() }))).operation;
+      if (collection === "interns") result = operation === "delete" ? await deleteIntern(id, user) : await updateIntern(id, request, user);
+      else result = operation === "delete" ? await deleteTeam(id, user) : await updateTeam(id, request, user);
+    }
     else if (collection === "clients") {
       const operation = (await parseBody(request.clone(), z.object({ operation: z.string().optional() }))).operation;
-      result = operation === "review" ? await reviewClient(id, request, user) : await updateClient(id, request, user);
+      result = operation === "review" ? await reviewClient(id, request, user)
+        : operation === "delete" ? await deleteClient(id, user)
+          : await updateClient(id, request, user);
     }
     else if (collection === "users") {
       const operation = (await parseBody(request.clone(), z.object({ operation: z.string().optional() }))).operation;

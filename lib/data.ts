@@ -1,10 +1,10 @@
 import "server-only";
 
-import { FieldPath, FieldValue, Filter, type Query, type WriteBatch } from "firebase-admin/firestore";
+import { AggregateField, FieldPath, FieldValue, Filter, type Query, type WriteBatch } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
 import { canReadCollection, canReadRecord } from "@/lib/access-control";
 import { redactRecordForRole } from "@/lib/record-security";
-import type { CollectionName, RecordData, Role, SessionUser } from "@/lib/types";
+import type { CollectionName, RecordData, Role, SessionUser, TeamWorkSummary } from "@/lib/types";
 import { serializeRecord } from "@/lib/http";
 
 const QUERY_LIMIT = 100;
@@ -26,12 +26,12 @@ function serializeSnapshot(snapshot: FirebaseFirestore.QueryDocumentSnapshot): R
 }
 
 async function projectIdsFor(user: SessionUser) {
-  const query = await scopedQuery("projects", user);
+  const query = await scopedQuery("projects", user, { includeSubmitted: false });
   const snapshot = await query.get();
   return snapshot.docs.map((project) => project.id);
 }
 
-async function scopedQuery(collection: CollectionName, user: SessionUser): Promise<Query> {
+async function scopedQuery(collection: CollectionName, user: SessionUser, { includeSubmitted = true } = {}): Promise<Query> {
   const db = adminDb();
   const rows = db.collection(collection);
 
@@ -42,14 +42,18 @@ async function scopedQuery(collection: CollectionName, user: SessionUser): Promi
       Filter.where("createdBy", "==", user.uid),
       Filter.where("assignedProductManager", "==", user.uid),
     ));
-    if (user.role === "team_member") return rows.where("createdBy", "==", user.uid);
     return rows.where(FieldPath.documentId(), "==", "__no_access__");
   }
   if (collection === "projects") {
     if (user.role === "super_admin") return rows;
-    if (user.role === "cto") return rows.where("assignedCto", "==", user.uid);
-    if (user.role === "product_manager") return rows.where("assignedProductManager", "==", user.uid);
-    return rows.where("assignedTeam", "array-contains", user.uid);
+    const assigned = user.role === "cto" ? Filter.where("assignedCto", "==", user.uid)
+      : user.role === "product_manager" ? Filter.where("assignedProductManager", "==", user.uid)
+        : Filter.where("assignedTeam", "array-contains", user.uid);
+    // Project lists also include projects the user submitted, so they can follow approval and team assignment.
+    // Task, report, and dashboard scopes pass includeSubmitted: false so they cover only assigned work
+    // (and so their extra filters, such as not-in, never combine with an OR query).
+    if (!includeSubmitted) return rows.where(assigned);
+    return rows.where(Filter.or(assigned, Filter.where("createdBy", "==", user.uid)));
   }
   if (collection === "projectRequests") {
     if (user.role === "super_admin") return rows;
@@ -91,6 +95,10 @@ async function scopedQuery(collection: CollectionName, user: SessionUser): Promi
     if (user.role === "cto") return rows.where("role", "==", "team_member");
     return rows.where(FieldPath.documentId(), "==", "__no_access__");
   }
+  if (collection === "interns" || collection === "teams") {
+    if (user.role === "super_admin") return rows;
+    return rows.where(FieldPath.documentId(), "==", "__no_access__");
+  }
   return rows.where(FieldPath.documentId(), "==", "__no_access__");
 }
 
@@ -119,8 +127,30 @@ export async function listRecords(collection: CollectionName, user: SessionUser)
   const records = documents
     .map(serializeSnapshot)
     .filter((record) => canReadRecord(user.role, user.uid, collection, record, scopedProjectIds));
-  const redacted = records.map((record) => redactRecordForRole(collection, record, user.role));
+  const redacted = records.map((record) => redactRecordForRole(collection, record, user.role, user.uid));
   return redacted.sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")));
+}
+
+export async function getTeamWorkSummary(): Promise<TeamWorkSummary[]> {
+  const db = adminDb();
+  const members = await db.collection("users").where("role", "==", "team_member").limit(QUERY_LIMIT).get();
+  const summaries = await Promise.all(members.docs.map(async (member) => {
+    const totals = await db.collection("workReports").where("employeeId", "==", member.id).aggregate({
+      reportCount: AggregateField.count(),
+      hoursLogged: AggregateField.sum("timeSpentHours"),
+    }).get();
+    const profile = member.data();
+    const totalsData = totals.data();
+    return {
+      uid: member.id,
+      displayName: String(profile.displayName ?? profile.email ?? member.id),
+      designation: String(profile.designation ?? ""),
+      accountStatus: profile.accountStatus === "suspended" ? "suspended" as const : "active" as const,
+      reportCount: totalsData.reportCount,
+      hoursLogged: totalsData.hoursLogged,
+    };
+  }));
+  return summaries.sort((a, b) => b.hoursLogged - a.hoursLogged || b.reportCount - a.reportCount || a.displayName.localeCompare(b.displayName));
 }
 
 export async function getRecord(collection: CollectionName, id: string) {
@@ -249,17 +279,17 @@ async function scopedProjectCount(collection: "tasks" | "workReports", user: Ses
 async function getDashboardTotals(user: SessionUser, workDate: string) {
   const db = adminDb();
   const clientQuery = await scopedQuery("clients", user);
-  const projectQuery = await scopedQuery("projects", user);
+  const projectQuery = await scopedQuery("projects", user, { includeSubmitted: false });
   const requestQuery = await scopedQuery("projectRequests", user);
   const activeProjectStatuses = ["approved", "planning", "in_progress", "on_hold", "blocked", "in_review"];
-  const allProjectStatuses = ["draft", "pending_cto_review", "approved", "planning", "in_progress", "on_hold", "blocked", "in_review", "completed", "cancelled", "archived"];
+  const allProjectStatuses = ["draft", "pending_approval", "rejected", "pending_cto_review", "approved", "planning", "in_progress", "on_hold", "blocked", "in_review", "completed", "cancelled", "archived"];
   const openTaskStatuses = ["open", "in_progress", "blocked"];
   const activeClients = aggregateCount(clientQuery.where("status", "==", "active"));
   const projectStatusCounts = Promise.all(allProjectStatuses.map(async (status) => ({
     status,
     count: await aggregateCount(projectQuery.where("status", "==", status)),
   })));
-  const overdueProjects = aggregateCount(projectQuery.where("expectedEndDate", "<", workDate).where("status", "not-in", ["completed", "cancelled", "archived"]));
+  const overdueProjects = aggregateCount(projectQuery.where("expectedEndDate", "<", workDate).where("status", "not-in", ["completed", "cancelled", "archived", "pending_approval", "rejected"]));
   const pendingProjectRequests = aggregateCount(requestQuery.where("status", "==", "pending_cto_review"));
   const changesRequested = aggregateCount(requestQuery.where("status", "==", "changes_requested"));
   let reportToday: Promise<number>;

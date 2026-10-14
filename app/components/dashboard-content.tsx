@@ -45,7 +45,7 @@ function todayInTimezone(timeZone: string) {
 }
 
 function isOpen(value: unknown) {
-  return !["completed", "cancelled", "accepted", "archived"].includes(text(value).toLowerCase());
+  return !["completed", "cancelled", "accepted", "archived", "pending_approval", "rejected"].includes(text(value).toLowerCase());
 }
 
 const roleCopy: Record<Role, { title: string; section: string; description: string }> = {

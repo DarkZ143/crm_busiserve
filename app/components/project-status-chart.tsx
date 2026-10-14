@@ -24,11 +24,11 @@ export function ProjectStatusChart({ data }: { data: ProjectStatusPoint[] }) {
     <div className="chart-wrap" role="img" aria-label="Projects by current status">
       <ResponsiveContainer width="100%" height="100%">
         <BarChart data={data} margin={{ top: 8, right: 8, left: -16, bottom: 2 }}>
-          <CartesianGrid vertical={false} stroke="#edf0ed" strokeDasharray="3 3" />
-          <XAxis dataKey="status" axisLine={false} tickLine={false} tick={{ fill: "#879188", fontSize: 9 }} />
-          <YAxis allowDecimals={false} axisLine={false} tickLine={false} tick={{ fill: "#9aa29b", fontSize: 9 }} />
-          <Tooltip cursor={{ fill: "#f5f7f5" }} contentStyle={{ border: "1px solid #e5e9e5", borderRadius: 8, fontSize: 11, boxShadow: "0 8px 22px rgb(20 32 23 / 8%)" }} />
-          <Bar dataKey="count" name="Projects" fill="#607b67" radius={[5, 5, 0, 0]} maxBarSize={44} />
+          <CartesianGrid vertical={false} stroke="#e4ebf3" strokeDasharray="3 3" />
+          <XAxis dataKey="status" axisLine={false} tickLine={false} tick={{ fill: "#70819a", fontSize: 9 }} />
+          <YAxis allowDecimals={false} axisLine={false} tickLine={false} tick={{ fill: "#8998ab", fontSize: 9 }} />
+          <Tooltip cursor={{ fill: "#f0f5fb" }} contentStyle={{ border: "1px solid #dce4ee", borderRadius: 8, fontSize: 11, boxShadow: "0 8px 22px rgb(4 25 53 / 10%)" }} />
+          <Bar dataKey="count" name="Projects" fill="#ff8926" radius={[5, 5, 0, 0]} maxBarSize={44} />
         </BarChart>
       </ResponsiveContainer>
     </div>

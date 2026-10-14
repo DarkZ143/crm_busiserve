@@ -1,6 +1,7 @@
 import { Suspense } from "react";
 import { connection } from "next/server";
 import { redirect } from "next/navigation";
+import { WorkspaceLoader } from "@/app/components/workspace-loader";
 import { getSessionUser } from "@/lib/auth";
 import { isFirebaseConfigured } from "@/lib/firebase-admin";
 import { isSetupComplete } from "@/lib/setup";
@@ -15,7 +16,7 @@ const homeByRole: Record<Role, string> = {
 
 export default function HomePage() {
   return (
-    <Suspense fallback={<div className="page-loading">Opening your workspace…</div>}>
+    <Suspense fallback={<WorkspaceLoader />}>
       <HomeRedirect />
     </Suspense>
   );

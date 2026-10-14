@@ -9,6 +9,8 @@ export type Role = (typeof ROLES)[number];
 export type AccountStatus = "active" | "suspended";
 export type ProjectStatus =
   | "draft"
+  | "pending_approval"
+  | "rejected"
   | "pending_cto_review"
   | "approved"
   | "planning"
@@ -39,6 +41,15 @@ export interface RecordData {
   [key: string]: unknown;
 }
 
+export interface TeamWorkSummary {
+  uid: string;
+  displayName: string;
+  designation: string;
+  accountStatus: AccountStatus;
+  reportCount: number;
+  hoursLogged: number;
+}
+
 export type CollectionName =
   | "clients"
   | "projects"
@@ -48,4 +59,6 @@ export type CollectionName =
   | "workReports"
   | "notifications"
   | "auditLogs"
-  | "users";
+  | "users"
+  | "interns"
+  | "teams";

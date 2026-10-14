@@ -14,6 +14,7 @@ export function canAccessArea(role: string, area: string) {
 
 export function canReadCollection(role: AccessRole, collection: string) {
   if (role === "super_admin") return true;
+  if (role === "team_member") return collection === "projects" || collection === "workReports";
   return collection === "clients" || collection === "projects";
 }
 
@@ -26,11 +27,14 @@ export function canReadRecord(
 ) {
   if (role === "super_admin") return true;
   if (collection === "clients") {
+    if (role === "team_member") return false;
     if (role === "cto") return record.createdBy === uid;
     if (role === "product_manager") return record.createdBy === uid || record.assignedProductManager === uid;
     return record.createdBy === uid;
   }
   if (collection === "projects") {
+    // The person who submitted a project can always follow its approval and team assignment.
+    if (record.createdBy === uid) return true;
     if (role === "cto") return record.assignedCto === uid;
     if (role === "product_manager") return record.assignedProductManager === uid;
     return Array.isArray(record.assignedTeam) && record.assignedTeam.includes(uid);
