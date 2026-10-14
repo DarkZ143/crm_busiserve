@@ -37,7 +37,7 @@ export function AuthLayout({ eyebrow, title, description, children }: {
           <h2>Good work moves<br />with clear ownership.</h2>
           <p>One secure place to coordinate clients, delivery teams, and the work behind every project.</p>
           <div className="aside-rule" />
-          <div className="aside-caption">BUSISERVE INFOTECH SOLUTIONS</div>
+          <div className="aside-caption">BUSISERVE INFOTECH SOLUTION</div>
         </div>
         <div className="aside-bottom">Project delivery · Team coordination · Business records</div>
       </aside>
