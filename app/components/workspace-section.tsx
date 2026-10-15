@@ -457,7 +457,7 @@ function RecordForm({
   }
 
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="modal-backdrop" role="presentation" data-lenis-prevent onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="modal-card" role="dialog" aria-modal="true" aria-label={title}>
         <header className="modal-header"><div><h2>{title}</h2><p>{description}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={17} /></button></header>
         <form className="record-form" onSubmit={form.handleSubmit(save)}>
@@ -553,7 +553,7 @@ function ReviewDialog({
   }
 
   return (
-    <div className="modal-backdrop" role="presentation">
+    <div className="modal-backdrop" role="presentation" data-lenis-prevent>
       <section className="modal-card" role="dialog" aria-modal="true" aria-label="Review record">
         <header className="modal-header"><div><h2>{requestKind ? "Review project request" : clientKind ? "Review client submission" : projectKind ? "Review project submission" : "Review work report"}</h2><p>{projectKind ? `${String(record.name ?? "Project")}${record.createdByName ? ` · submitted by ${String(record.createdByName)}` : ""}` : String(record.clientName ?? record.projectName ?? record.workSummary ?? "Record")}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={17} /></button></header>
         <div className="review-form">
@@ -640,7 +640,7 @@ function ProjectDetailsDialog({ record, onClose }: { record: RecordData; onClose
   const interns = projectInterns(record);
   const reviewer = record.reviewedByName ? String(record.reviewedByName) : "";
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="modal-backdrop" role="presentation" data-lenis-prevent onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="project-details-title">
         <header className="modal-header">
           <div><h2 id="project-details-title">{String(record.name ?? "Project")}</h2><p>{String(record.projectId ?? "")}</p></div>
@@ -1014,7 +1014,7 @@ export function WorkspaceSection({
         />
       )}
       {detailRecord && <ProjectDetailsDialog record={detailRecord} onClose={() => setDetailRecord(null)} />}
-      {manageTeam && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setManageTeam(null); }}>
+      {manageTeam && <div className="modal-backdrop" role="presentation" data-lenis-prevent onMouseDown={(event) => { if (event.target === event.currentTarget) setManageTeam(null); }}>
         <section className="modal-card team-members-dialog" role="dialog" aria-modal="true" aria-labelledby="team-members-title">
           <header className="modal-header">
             <div><h2 id="team-members-title">Manage members</h2><p>{String(manageTeam.name ?? "Team")} · {String(manageTeam.category ?? "General")} · ID: {manageTeam.id}</p></div>
@@ -1041,7 +1041,7 @@ export function WorkspaceSection({
         </section>
       </div>}
       {reviewRecord && collection && <ReviewDialog collection={collection} record={reviewRecord} users={auxiliary.users} teams={auxiliary.teams} onClose={() => setReviewRecord(null)} onComplete={() => { setReviewRecord(null); router.refresh(); }} />}
-      {deleteTarget && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDeleteDialog(); }}>
+      {deleteTarget && <div className="modal-backdrop" role="presentation" data-lenis-prevent onMouseDown={(event) => { if (event.target === event.currentTarget) closeDeleteDialog(); }}>
         <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="delete-user-title">
           <header className="modal-header">
             <div>
