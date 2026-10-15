@@ -1,6 +1,6 @@
 import "server-only";
 
-import { AggregateField, FieldPath, FieldValue, Filter, type Query, type WriteBatch } from "firebase-admin/firestore";
+import { FieldPath, FieldValue, Filter, type Query, type WriteBatch } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
 import { canReadCollection, canReadRecord } from "@/lib/access-control";
 import { redactRecordForRole } from "@/lib/record-security";
@@ -8,6 +8,8 @@ import type { CollectionName, RecordData, Role, SessionUser, TeamWorkSummary } f
 import { serializeRecord } from "@/lib/http";
 
 const QUERY_LIMIT = 100;
+/** Reports read in one pass to total each member's hours. Well above what a team files in a year. */
+const REPORT_TOTALS_LIMIT = 10000;
 
 export async function getCompanyTimezone() {
   const settings = await adminDb().doc("companySettings/general").get();
@@ -133,23 +135,32 @@ export async function listRecords(collection: CollectionName, user: SessionUser)
 
 export async function getTeamWorkSummary(): Promise<TeamWorkSummary[]> {
   const db = adminDb();
-  const members = await db.collection("users").where("role", "==", "team_member").limit(QUERY_LIMIT).get();
-  const summaries = await Promise.all(members.docs.map(async (member) => {
-    const totals = await db.collection("workReports").where("employeeId", "==", member.id).aggregate({
-      reportCount: AggregateField.count(),
-      hoursLogged: AggregateField.sum("timeSpentHours"),
-    }).get();
+  // Totals are grouped from a single projected read of the two fields that matter. A per-member sum
+  // aggregation would need a composite index on every filtered field, and cost one round trip per member.
+  const [members, reports] = await Promise.all([
+    db.collection("users").where("role", "==", "team_member").limit(QUERY_LIMIT).get(),
+    db.collection("workReports").select("employeeId", "timeSpentHours").limit(REPORT_TOTALS_LIMIT).get(),
+  ]);
+  const totals = new Map<string, { reportCount: number; hoursLogged: number }>();
+  for (const report of reports.docs) {
+    const employeeId = String(report.get("employeeId") ?? "");
+    if (!employeeId) continue;
+    const hours = Number(report.get("timeSpentHours"));
+    const running = totals.get(employeeId) ?? { reportCount: 0, hoursLogged: 0 };
+    totals.set(employeeId, { reportCount: running.reportCount + 1, hoursLogged: running.hoursLogged + (Number.isFinite(hours) ? hours : 0) });
+  }
+  const summaries = members.docs.map((member) => {
     const profile = member.data();
-    const totalsData = totals.data();
+    const memberTotals = totals.get(member.id);
     return {
       uid: member.id,
       displayName: String(profile.displayName ?? profile.email ?? member.id),
       designation: String(profile.designation ?? ""),
       accountStatus: profile.accountStatus === "suspended" ? "suspended" as const : "active" as const,
-      reportCount: totalsData.reportCount,
-      hoursLogged: totalsData.hoursLogged,
+      reportCount: memberTotals?.reportCount ?? 0,
+      hoursLogged: Math.round((memberTotals?.hoursLogged ?? 0) * 100) / 100,
     };
-  }));
+  });
   return summaries.sort((a, b) => b.hoursLogged - a.hoursLogged || b.reportCount - a.reportCount || a.displayName.localeCompare(b.displayName));
 }
 

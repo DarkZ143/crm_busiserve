@@ -222,6 +222,13 @@ a { color: inherit; text-decoration: none; }
 .setup-instructions strong { margin-bottom: 3px; color: #505b52; font-size: 11px; }
 .setup-instructions code { color: #6a766c; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
 .form-field-error { color: #a63e3e; font-size: 9px; }
+.picker-field { display: grid; min-width: 0; gap: 7px; }
+.picker-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.picker-chips li { display: inline-flex; max-width: 100%; align-items: center; gap: 4px; border: 1px solid #e2e7e2; border-radius: 999px; background: #f8faf8; padding: 3px 4px 3px 10px; color: #4f5b52; font-size: 9px; }
+.picker-chips span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-chip-remove { display: grid; width: 18px; height: 18px; flex-shrink: 0; place-items: center; border: 0; border-radius: 50%; background: transparent; color: #8a948c; cursor: pointer; }
+.picker-chip-remove:hover { background: #ebefeb; color: #9b3733; }
+.form-field-hint { color: #89928b; font-size: 9px; line-height: 1.5; }
 .toolbar-actions { display: flex; align-items: center; gap: 8px; }
 .filter-select { min-height: 34px; border: 1px solid #e5e9e5; border-radius: 7px; background: white; padding: 0 25px 0 9px; color: #657067; font-size: 10px; }
 .table-footer { display: flex; min-height: 46px; align-items: center; justify-content: space-between; border-top: 1px solid #edf0ed; padding: 0 14px; color: #8a948c; font-size: 9px; }
@@ -335,7 +342,8 @@ a { color: inherit; text-decoration: none; }
 .table-footer { color: #68756b; font-size: 12px; }
 .small-action, .role-select { font-size: 12px; }
 .form-field label, .field-label { font-size: 13px; }
-.form-field-error, .form-error-inline { font-size: 12px; }
+.form-field-error, .form-field-hint, .form-error-inline { font-size: 12px; }
+.picker-chips li { font-size: 12px; }
 .form-field .text-input, .form-field .select-input, .form-field .textarea-input { font-size: 14px; }
 .button { font-size: 13px; }
 .form-helper, .inline-link, .back-link { font-size: 12px; }

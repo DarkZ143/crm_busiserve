@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { useForm } from "react-hook-form";
+import { useController, useForm, useWatch, type Control, type UseFormReturn } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import Link from "next/link";
@@ -19,7 +19,14 @@ type Field = {
   required?: boolean;
   full?: boolean;
   options?: Option[];
+  /** Rebuilds this field's options from another field's current value. */
+  dependsOn?: string;
+  optionsFor?: (dependencyValue: string) => Option[];
+  /** Shown under a dependent field while it has nothing to offer. */
+  emptyHint?: string;
   multiple?: boolean;
+  /** Picks values one at a time from a dropdown and lists what was chosen. Needs multiple. */
+  picker?: boolean;
   min?: number;
   max?: number;
   placeholder?: string;
@@ -124,6 +131,20 @@ function assignableProjectOptions(projects: RecordData[]): Option[] {
   return fieldOptions(projects.filter((record) => projectApprovalStatus(record) === "approved" && !["completed", "cancelled", "archived"].includes(String(record.status))), "id", "name");
 }
 
+/** A task can only go to someone already on the project's team, so the list follows the chosen project. */
+function projectAssigneeOptions(auxiliary: Auxiliary, projectId: string): Option[] {
+  const project = auxiliary.projects.find((record) => record.id === projectId);
+  if (!project) return [];
+  return teamMembers(project).flatMap((member) => {
+    const account = auxiliary.users.find((record) => record.id === member.uid);
+    // The server only accepts active accounts, so a suspended member is not offered.
+    if (account && account.accountStatus !== "active") return [];
+    const name = String(account?.displayName ?? member.displayName);
+    const designation = String(account?.designation ?? member.designation);
+    return [{ value: member.uid, label: designation ? `${name} · ${designation}` : name }];
+  });
+}
+
 /**
  * Edit forms only offer assignable records (approved, open projects; active accounts). Anything already linked
  * that falls outside that set is added back with its state, so it stays selected and is only removed on purpose.
@@ -142,6 +163,10 @@ function withExistingOptions(fields: Field[], record: RecordData, auxiliary: Aux
       const intern = auxiliary.interns.find((item) => item.id === id);
       return intern ? `${String(intern.fullName ?? id)} · ${String(intern.internId ?? id)} (${humanize(intern.status)})` : "Removed intern";
     },
+    teamIds: (id) => {
+      const team = auxiliary.teams.find((item) => item.id === id);
+      return team ? String(team.name ?? id) : "Removed team";
+    },
   };
   lookups.assignedTeam = lookups.memberUids;
   return fields.map((field) => {
@@ -153,6 +178,11 @@ function withExistingOptions(fields: Field[], record: RecordData, auxiliary: Aux
     const missing = linked.filter((id) => !options.some((option) => option.value === id));
     return missing.length ? { ...field, options: [...options, ...missing.map((id) => ({ value: id, label: label(id) }))] } : field;
   });
+}
+
+/** Teams an intern belongs to. Membership is stored on the team, not on the intern. */
+function internTeamIds(internId: string, teams: RecordData[]): string[] {
+  return teams.filter((team) => idsOf(team.internIds).includes(internId)).map((team) => team.id);
 }
 
 function plainText(value: unknown) {
@@ -251,7 +281,6 @@ function createFields(collection: CollectionName | null, role: Role, auxiliary: 
     { name: "priority", label: "Priority", type: "select", options: priorityOptions },
   ];
   if (collection === "interns") return [
-    { name: "internId", label: "Intern ID", required: true, placeholder: "e.g. BUS-INT-014" },
     { name: "fullName", label: "Full name", required: true },
     { name: "role", label: "Internship role", required: true, placeholder: "Frontend developer, UI designer, QA…" },
     { name: "joiningDate", label: "Joining date", type: "date", required: true },
@@ -260,7 +289,8 @@ function createFields(collection: CollectionName | null, role: Role, auxiliary: 
     { name: "email", label: "Email", type: "email" },
     { name: "phone", label: "Phone number" },
     { name: "college", label: "College or institute", full: true },
-    { name: "projectIds", label: "Assign projects", type: "select", multiple: true, full: true, options: assignableProjectOptions(auxiliary.projects) },
+    { name: "teamIds", label: "Assign teams", type: "select", multiple: true, picker: true, full: true, placeholder: "Select a team to add", options: fieldOptions(auxiliary.teams, "id", "name") },
+    { name: "projectIds", label: "Assign projects", type: "select", multiple: true, picker: true, full: true, placeholder: "Select a project to add", options: assignableProjectOptions(auxiliary.projects) },
     { name: "notes", label: "Notes", type: "textarea", full: true },
   ];
   if (collection === "teams") return [
@@ -272,8 +302,8 @@ function createFields(collection: CollectionName | null, role: Role, auxiliary: 
     { name: "projectIds", label: "Assign to projects", type: "select", multiple: true, full: true, options: assignableProjectOptions(auxiliary.projects) },
   ];
   if (collection === "tasks") return [
-    { name: "projectId", label: "Project", type: "select", required: true, options: fieldOptions(auxiliary.projects, "id", "name") },
-    { name: "assigneeId", label: "Team member", type: "select", required: true, options: fieldOptions(auxiliary.users.filter((record) => record.role === "team_member" && record.accountStatus === "active"), "id", "displayName") },
+    { name: "projectId", label: "Project", type: "select", required: true, options: assignableProjectOptions(auxiliary.projects) },
+    { name: "assigneeId", label: "Team member", type: "select", required: true, dependsOn: "projectId", optionsFor: (projectId) => projectAssigneeOptions(auxiliary, projectId), emptyHint: "Pick a project first. Only people already on that project's team can be given a task — add them to the project to see them here." },
     { name: "title", label: "Task title", required: true },
     { name: "priority", label: "Priority", type: "select", options: priorityOptions },
     { name: "dueDate", label: "Due date", type: "date" },
@@ -395,6 +425,44 @@ function createSchema(fields: Field[]) {
   return z.object(shape);
 }
 
+/** Multi-value field that adds one option at a time from a dropdown and lists what was chosen. */
+function PickerField({ field, options, control }: { field: Field; options: Option[]; control: Control<Record<string, unknown>> }) {
+  const { field: { value, onBlur, onChange } } = useController({ name: field.name, control });
+  const chosen = idsOf(value);
+  const available = options.filter((option) => !chosen.includes(option.value));
+  return (
+    <div className="picker-field">
+      <select
+        className="select-input"
+        id={`field-${field.name}`}
+        value=""
+        disabled={!available.length}
+        onBlur={onBlur}
+        onChange={(event) => { if (event.target.value) onChange([...chosen, event.target.value]); }}
+      >
+        <option value="">{!options.length ? "Nothing available yet" : available.length ? field.placeholder ?? "Select an option" : "All added"}</option>
+        {available.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select>
+      {chosen.length > 0 && <ul className="picker-chips">{chosen.map((chosenValue) => {
+        const label = options.find((option) => option.value === chosenValue)?.label ?? chosenValue;
+        return <li key={chosenValue}><span>{label}</span><button className="picker-chip-remove" type="button" aria-label={`Remove ${label}`} onClick={() => onChange(chosen.filter((item) => item !== chosenValue))}><X size={11} /></button></li>;
+      })}</ul>}
+    </div>
+  );
+}
+
+function RegisteredInput({ field, options, dependents, form }: { field: Field; options: Option[]; dependents: Field[]; form: UseFormReturn<Record<string, unknown>> }) {
+  const registration = form.register(field.name);
+  if (field.type === "textarea") return <textarea className="textarea-input" id={`field-${field.name}`} placeholder={field.placeholder} maxLength={8000} {...registration} />;
+  if (field.type === "select") return (
+    <select className="select-input" id={`field-${field.name}`} multiple={field.multiple} {...registration} onChange={(event) => { void registration.onChange(event); for (const dependent of dependents) form.setValue(dependent.name, dependent.multiple ? [] : ""); }}>
+      {!field.multiple && <option value="">Select an option</option>}
+      {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+    </select>
+  );
+  return <input className="text-input" id={`field-${field.name}`} type={field.type ?? "text"} placeholder={field.placeholder} min={field.min} max={field.max} minLength={field.name === "password" ? 12 : undefined} maxLength={field.name === "password" ? 128 : field.type === "number" ? undefined : 500} autoComplete={field.name === "password" ? "new-password" : undefined} {...registration} />;
+}
+
 function RecordForm({
   fields,
   title,
@@ -422,6 +490,7 @@ function RecordForm({
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const schema = useMemo(() => createSchema(fields), [fields]);
+  const dependencyNames = useMemo(() => [...new Set(fields.flatMap((field) => field.dependsOn ? [field.dependsOn] : []))], [fields]);
   const form = useForm<Record<string, unknown>>({
     resolver: zodResolver(schema),
     defaultValues: {
@@ -430,6 +499,8 @@ function RecordForm({
       ...(initialValues ?? {}),
     },
   });
+  const watchedDependencies = useWatch({ control: form.control, name: dependencyNames });
+  const dependencyValues = Object.fromEntries(dependencyNames.map((name, index) => [name, String(watchedDependencies[index] ?? "")]));
 
   async function save(values: Record<string, unknown>) {
     setPending(true);
@@ -461,22 +532,21 @@ function RecordForm({
       <section className="modal-card" role="dialog" aria-modal="true" aria-label={title}>
         <header className="modal-header"><div><h2>{title}</h2><p>{description}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={17} /></button></header>
         <form className="record-form" onSubmit={form.handleSubmit(save)}>
-          {fields.map((field) => (
-            <div className={`form-field ${field.full ? "full" : ""}`} key={field.name}>
-              <label htmlFor={`field-${field.name}`}>{field.label}{field.required ? " *" : ""}</label>
-              {field.type === "textarea" ? (
-                <textarea className="textarea-input" id={`field-${field.name}`} placeholder={field.placeholder} maxLength={8000} {...form.register(field.name)} />
-              ) : field.type === "select" ? (
-                <select className="select-input" id={`field-${field.name}`} multiple={field.multiple} {...form.register(field.name)}>
-                  {!field.multiple && <option value="">Select an option</option>}
-                  {(field.options ?? []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              ) : (
-                <input className="text-input" id={`field-${field.name}`} type={field.type ?? "text"} placeholder={field.placeholder} min={field.min} max={field.max} minLength={field.name === "password" ? 12 : undefined} maxLength={field.name === "password" ? 128 : field.type === "number" ? undefined : 500} autoComplete={field.name === "password" ? "new-password" : undefined} {...form.register(field.name)} />
-              )}
-              {form.formState.errors[field.name] && <span className="form-field-error">{String(form.formState.errors[field.name]?.message ?? "Check this field.")}</span>}
-            </div>
-          ))}
+          {fields.map((field) => {
+            const options = field.optionsFor ? field.optionsFor(dependencyValues[field.dependsOn ?? ""] ?? "") : field.options ?? [];
+            // Changing a parent field rebuilds the lists below it, so any choice that is no longer offered is cleared.
+            const dependents = fields.filter((item) => item.dependsOn === field.name);
+            return (
+              <div className={`form-field ${field.full ? "full" : ""}`} key={field.name}>
+                <label htmlFor={`field-${field.name}`}>{field.label}{field.required ? " *" : ""}</label>
+                {field.picker
+                  ? <PickerField field={field} options={options} control={form.control} />
+                  : <RegisteredInput field={field} options={options} dependents={dependents} form={form} />}
+                {field.emptyHint && !options.length && <span className="form-field-hint">{field.emptyHint}</span>}
+                {form.formState.errors[field.name] && <span className="form-field-error">{String(form.formState.errors[field.name]?.message ?? "Check this field.")}</span>}
+              </div>
+            );
+          })}
           {error && <div className="form-error-inline" role="alert">{error}</div>}
           <div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-primary" type="submit" disabled={pending}>{pending ? "Saving…" : method === "PATCH" ? "Save changes" : "Save record"}</button></div>
         </form>
@@ -1004,11 +1074,11 @@ export function WorkspaceSection({
           ].map((field) => withExistingOptions([field as Field], editRecord, auxiliary)[0]) : editRecord && collection === "interns" ? withExistingOptions(fields.filter((field) => field.name !== "internId"), editRecord, auxiliary) : editRecord && collection === "teams" ? withExistingOptions(fields, editRecord, auxiliary) : fields}
           sendClearedFields={Boolean(editRecord && (collection === "interns" || collection === "teams"))}
           title={editRecord ? collection === "workReports" ? "Revise work report" : collection === "projectRequests" ? "Revise project request" : collection === "projects" ? "Update project delivery" : collection === "interns" ? `Edit intern ${String(editRecord.internId ?? "")}` : collection === "teams" ? "Edit team" : "Edit client" : section === "employees" ? "Add a full-time employee" : collection === "users" ? "Create a workspace user" : collection === "interns" ? "Add an intern" : collection === "teams" ? "Create a team" : collection === "projects" && user.role !== "super_admin" ? "Submit a project for approval" : `Create ${section.replaceAll("-", " ").replace(/s$/, "")}`}
-          description={editRecord ? collection === "workReports" ? "Your previous report version will remain in the revision history." : collection === "projectRequests" ? "Your previous submission will remain in the revision history." : collection === "projects" ? "Update project delivery, commercial terms, and team. Everyone in a selected team is added to the project." : collection === "teams" ? "Edit the team category, name, members, and project assignments." : "Changes are saved with an audit record." : section === "employees" ? "Create a workspace account for a full-time employee. Their role is set to Team member so they can join teams and projects." : collection === "interns" ? "Give the intern a unique ID and role. You can assign projects now or later, and add them to teams from Team Management." : collection === "teams" ? "Create a category-based team. Its ID and creation date are saved automatically; add employees and interns now or manage them later." : collection === "users" ? "Set a unique user ID, login email, role, and initial password." : collection === "clients" && user.role !== "super_admin" ? "New client submissions stay pending until a Super Admin approves them." : collection === "projects" && user.role !== "super_admin" ? "Your project stays pending until a Super Admin approves it and assigns a team. You can follow its status from this page." : collection === "projectRequests" ? "Save a draft for later or submit the request to the CTO for review." : "Complete the required details. Record access is checked again on the server."}
+          description={editRecord ? collection === "workReports" ? "Your previous report version will remain in the revision history." : collection === "projectRequests" ? "Your previous submission will remain in the revision history." : collection === "projects" ? "Update project delivery, commercial terms, and team. Everyone in a selected team is added to the project." : collection === "teams" ? "Edit the team category, name, members, and project assignments." : "Changes are saved with an audit record." : section === "employees" ? "Create a workspace account for a full-time employee. Their role is set to Team member so they can join teams and projects." : collection === "interns" ? "Add the intern's details and role. Their intern ID is generated automatically when the record is saved. Assign teams and projects now or change them later." : collection === "teams" ? "Create a category-based team. Its ID and creation date are saved automatically; add employees and interns now or manage them later." : collection === "users" ? "Set a unique user ID, login email, role, and initial password." : collection === "clients" && user.role !== "super_admin" ? "New client submissions stay pending until a Super Admin approves them." : collection === "projects" && user.role !== "super_admin" ? "Your project stays pending until a Super Admin approves it and assigns a team. You can follow its status from this page." : collection === "projectRequests" ? "Save a draft for later or submit the request to the CTO for review." : "Complete the required details. Record access is checked again on the server."}
           endpoint={editRecord ? `/api/records/${collection}/${editRecord.id}` : `/api/records/${collection}`}
           method={editRecord ? "PATCH" : "POST"}
           extraPayload={section === "employees" && !editRecord ? { role: "team_member" } : editRecord && collection === "workReports" ? { operation: "revise" } : editRecord && collection === "projectRequests" ? { action: "revise" } : undefined}
-          initialValues={editRecord && collection === "projects" ? { ...editRecord, assignedTeam: directTeamOf(editRecord), teamIds: projectTeams(editRecord).map((team) => team.id) } : editRecord && collection === "teams" ? { ...editRecord, category: String(editRecord.category ?? "General") } : editRecord ?? (collection === "interns" ? { status: "active", joiningDate: companyDate } : collection === "teams" ? { category: "General" } : collection === "workReports" ? { workDate: companyDate } : collection === "projectRequests" ? { status: "pending_cto_review", currency: "INR" } : collection === "clients" && user.role === "super_admin" ? { status: "active" } : collection === "projects" ? user.role === "super_admin" ? { currency: "INR", priority: "normal" } : { priority: "normal" } : collection === "tasks" ? { priority: "normal" } : {})}
+          initialValues={editRecord && collection === "projects" ? { ...editRecord, assignedTeam: directTeamOf(editRecord), teamIds: projectTeams(editRecord).map((team) => team.id) } : editRecord && collection === "interns" ? { ...editRecord, teamIds: internTeamIds(editRecord.id, auxiliary.teams) } : editRecord && collection === "teams" ? { ...editRecord, category: String(editRecord.category ?? "General") } : editRecord ?? (collection === "interns" ? { status: "active", joiningDate: companyDate } : collection === "teams" ? { category: "General" } : collection === "workReports" ? { workDate: companyDate } : collection === "projectRequests" ? { status: "pending_cto_review", currency: "INR" } : collection === "clients" && user.role === "super_admin" ? { status: "active" } : collection === "projects" ? user.role === "super_admin" ? { currency: "INR", priority: "normal" } : { priority: "normal" } : collection === "tasks" ? { priority: "normal" } : {})}
           onClose={() => { setFormOpen(false); setEditRecord(null); }}
           onSuccess={formSucceeded}
         />

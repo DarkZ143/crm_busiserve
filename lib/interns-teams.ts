@@ -30,14 +30,13 @@ const internFields = {
   joiningDate: z.string().date(),
   endDate: z.string().date().optional(),
   status: z.enum(INTERN_STATUSES).optional(),
+  teamIds: idList.optional(),
   projectIds: idList.optional(),
   notes: z.string().trim().max(2000).optional(),
 };
 
-const internCreateSchema = z.object({
-  internId: z.string().trim().min(2).max(64).regex(/^[A-Za-z0-9_-]+$/, "Use letters, numbers, dashes, and underscores for the intern ID."),
-  ...internFields,
-});
+// The intern ID is generated on save, so it is never part of the submitted form.
+const internCreateSchema = z.object(internFields);
 
 // On edit, an empty string clears an optional field.
 const internUpdateSchema = z.object({
@@ -49,6 +48,7 @@ const internUpdateSchema = z.object({
   joiningDate: internFields.joiningDate.optional(),
   endDate: z.union([z.literal(""), z.string().date()]).optional(),
   status: internFields.status,
+  teamIds: internFields.teamIds,
   projectIds: internFields.projectIds,
   notes: internFields.notes,
 });
@@ -104,19 +104,38 @@ function defined<T extends Record<string, unknown>>(value: T) {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as Partial<T>;
 }
 
+const INTERN_ID_PREFIX = "BSITS-";
+
+/** Reserves the next free sequential intern ID (BSITS-001, BSITS-002, …) while the create transaction is open. */
+async function nextInternId(transaction: FirebaseFirestore.Transaction) {
+  const db = adminDb();
+  const counterRef = db.collection("counters").doc("interns");
+  const counter = await transaction.get(counterRef);
+  let sequence = Number(counter.data()?.nextSequence ?? 0);
+  if (!Number.isInteger(sequence) || sequence < 1) {
+    // First run, or a counter that was never written: continue after the highest sequence already issued.
+    const latest = await transaction.get(db.collection("interns").orderBy("internSequence", "desc").limit(1));
+    sequence = Number(latest.docs[0]?.data()?.internSequence ?? 0) + 1;
+  }
+  // Interns added before IDs were generated may already hold one of these IDs, so skip any that is taken.
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const internId = `${INTERN_ID_PREFIX}${String(sequence).padStart(3, "0")}`;
+    const existing = await transaction.get(db.collection("interns").doc(internId));
+    if (!existing.exists) return { internId, sequence, counterRef };
+    sequence += 1;
+  }
+  throw new HttpError("Could not generate an intern ID. Try again.", 500);
+}
+
 export async function createIntern(request: Request, user: SessionUser) {
   requireSuperAdmin(user);
   const input = await parseBody(request, internCreateSchema);
   assertDateOrder(input.joiningDate, input.endDate);
   const projectIds = input.projectIds ?? [];
-  await validateProjects(projectIds);
+  const teamIds = input.teamIds ?? [];
+  const [selectedTeams] = await Promise.all([assertTeamsExist(teamIds), validateProjects(projectIds)]);
   const db = adminDb();
-  const ref = db.collection("interns").doc(input.internId);
-  const internIdLower = input.internId.toLowerCase();
   const record = {
-    id: input.internId,
-    internId: input.internId,
-    internIdLower,
     fullName: input.fullName,
     role: input.role,
     email: input.email ?? "",
@@ -132,17 +151,18 @@ export async function createIntern(request: Request, user: SessionUser) {
     updatedAt: FieldValue.serverTimestamp(),
   };
   const auditRef = db.collection("auditLogs").doc();
-  await db.runTransaction(async (transaction) => {
-    const [existing, sameId] = await Promise.all([
-      transaction.get(ref),
-      transaction.get(db.collection("interns").where("internIdLower", "==", internIdLower).limit(1)),
-    ]);
-    if (existing.exists || !sameId.empty) throw new HttpError("An intern with this ID already exists.", 409);
-    transaction.set(ref, record);
-    transaction.set(auditRef, auditEntry(user, "intern_added", "interns", ref.id, { fullName: input.fullName, role: input.role, projectIds }));
+  const stored = await db.runTransaction(async (transaction) => {
+    const next = await nextInternId(transaction);
+    const intern = { ...record, id: next.internId, internId: next.internId, internIdLower: next.internId.toLowerCase(), internSequence: next.sequence };
+    transaction.set(db.collection("interns").doc(next.internId), intern);
+    transaction.set(next.counterRef, { nextSequence: next.sequence + 1, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    for (const team of selectedTeams) transaction.update(team.ref, { internIds: FieldValue.arrayUnion(next.internId), updatedAt: FieldValue.serverTimestamp() });
+    transaction.set(auditRef, auditEntry(user, "intern_added", "interns", next.internId, { fullName: input.fullName, role: input.role, teamIds, projectIds }));
+    return intern;
   });
-  await syncProjectAssignments(projectIds);
-  return { ...record, createdAt: null, updatedAt: null };
+  // Joining a team also puts the intern on that team's projects.
+  await syncProjectAssignments([...projectIds, ...selectedTeams.flatMap((team) => stringArray(team.data()?.projectIds))]);
+  return { ...stored, createdAt: null, updatedAt: null };
 }
 
 export async function updateIntern(id: string, request: Request, user: SessionUser) {
@@ -156,15 +176,33 @@ export async function updateIntern(id: string, request: Request, user: SessionUs
   assertDateOrder(input.joiningDate ?? current.joiningDate, input.endDate ?? current.endDate);
   const previousProjects = stringArray(current.projectIds);
   if (input.projectIds) await validateProjects(input.projectIds, previousProjects);
-  const changes = defined(input);
+  // Team membership lives on the team, not on the intern, so it is applied separately from the intern's own fields.
+  const { teamIds, ...internInput } = input;
+  const [selectedTeams, currentTeams] = await Promise.all([
+    teamIds ? assertTeamsExist(teamIds) : Promise.resolve([]),
+    db.collection("teams").where("internIds", "array-contains", id).get(),
+  ]);
+  const changes = defined(internInput);
   const batch = db.batch();
   batch.update(ref, { ...changes, updatedAt: FieldValue.serverTimestamp() });
-  addAuditToBatch(batch, user, "intern_updated", "interns", id, { changedFields: Object.keys(changes), ...(input.projectIds ? { projectIds: input.projectIds } : {}) });
+  if (teamIds) {
+    for (const team of selectedTeams.filter((team) => !currentTeams.docs.some((joined) => joined.id === team.id))) {
+      batch.update(team.ref, { internIds: FieldValue.arrayUnion(id), updatedAt: FieldValue.serverTimestamp() });
+    }
+    for (const team of currentTeams.docs.filter((joined) => !teamIds.includes(joined.id))) {
+      batch.update(team.ref, { internIds: FieldValue.arrayRemove(id), updatedAt: FieldValue.serverTimestamp() });
+    }
+  }
+  addAuditToBatch(batch, user, "intern_updated", "interns", id, { changedFields: Object.keys(changes), ...(input.projectIds ? { projectIds: input.projectIds } : {}), ...(teamIds ? { teamIds } : {}) });
   await batch.commit();
-  // Name, role, and project changes all show up in project summaries, including projects reached through a team.
-  const teams = await db.collection("teams").where("internIds", "array-contains", id).get();
-  await syncProjectAssignments([...previousProjects, ...(input.projectIds ?? []), ...teams.docs.flatMap((team) => stringArray(team.data().projectIds))]);
-  return { id, ...changes };
+  // Name, role, team, and project changes all show up in project summaries, including projects reached through a team.
+  await syncProjectAssignments([
+    ...previousProjects,
+    ...(input.projectIds ?? []),
+    ...currentTeams.docs.flatMap((team) => stringArray(team.data().projectIds)),
+    ...selectedTeams.flatMap((team) => stringArray(team.data()?.projectIds)),
+  ]);
+  return { id, ...changes, ...(teamIds ? { teamIds } : {}) };
 }
 
 export async function deleteIntern(id: string, user: SessionUser) {
