@@ -402,3 +402,100 @@ a { color: inherit; text-decoration: none; }
 .segmented-tab.active { background: var(--accent); color: var(--brand-navy-deep); }
 .segmented-tab.active span { background: rgb(3 26 56 / 12%); color: var(--brand-navy-deep); }
 .status-discontinued { background: #fff1f0; color: #a64e49; }
+
+/* ---------------------------------------------------------------------------
+   Device coverage
+   Appended last so each rule wins on equal specificity. Width-scoped blocks
+   use ranges so they cannot leak into the 800px/520px blocks defined above.
+   --------------------------------------------------------------------------- */
+
+/* Dynamic viewport units: mobile browsers report 100vh as the chrome-less
+   height, so full-height panes overflowed behind the address bar on iOS and
+   Android. On desktop dvh resolves identically to vh. */
+.auth-shell, .auth-aside, .auth-main { min-height: 100dvh; }
+.workspace-shell, .workspace-main, .page-loading { min-height: 100dvh; }
+.sidebar { height: 100dvh; }
+.modal-card { max-height: calc(100dvh - 44px); }
+
+/* The split auth layout needs 940px of track width (520 + 420), but only
+   collapsed at 800px, so 801-939px overflowed horizontally. Collapse before
+   that minimum is reached rather than letting tablets scroll sideways. */
+@media (min-width: 801px) and (max-width: 960px) {
+  .auth-shell { grid-template-columns: 1fr; }
+  .auth-aside { display: none; }
+  .auth-main { padding: 52px 32px; }
+  .auth-copy { margin: 58px 0 32px; }
+}
+
+/* Tablet portrait: two dashboard columns at 270px min plus the 248px sidebar
+   left the side panel cramped, and the 4-up toolbar wrapped awkwardly. */
+@media (min-width: 801px) and (max-width: 1000px) {
+  .dashboard-grid { grid-template-columns: 1fr; }
+  .workspace-content { padding: 28px 20px 44px; }
+}
+
+/* Phones: let long table cells and dialog content use the full width. */
+@media (max-width: 520px) {
+  .modal-backdrop { align-items: start; padding: 12px; }
+  .modal-card { max-height: calc(100dvh - 24px); }
+  .modal-header { padding: 16px 16px 13px; }
+  .modal-header h2 { font-size: 15px; }
+  .team-members-content { padding: 15px 16px 16px; }
+  .checkbox-list { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); max-height: 190px; }
+  .segmented-tabs { display: flex; width: 100%; }
+  .segmented-tab { flex: 1; justify-content: center; }
+  .team-cell { max-width: 160px; }
+  .settings-form, .review-form, .record-form { padding: 16px; }
+  .detail-grid { grid-template-columns: 1fr; }
+  .form-actions { flex-wrap: wrap; }
+  .form-actions .button { flex: 1; }
+}
+
+/* Narrow phones (<=380px): the 2-up stat grid leaves ~118px of inner card
+   width, and once the 29px icon is subtracted the longer labels ("Active team
+   members", "Awaiting CTO review") wrap over three lines. */
+@media (max-width: 380px) {
+  .stats-grid { grid-template-columns: 1fr; }
+  .stat-card { min-height: auto; }
+  .topbar { gap: 8px; }
+  .topbar-right { gap: 7px; }
+  .workspace-content { padding: 18px 9px 30px; }
+  .page-heading h1 { font-size: 21px; }
+  .table-footer { flex-wrap: wrap; gap: 7px; min-height: auto; padding: 9px 12px; }
+}
+
+/* Touch devices: the compact desktop controls sat well under a comfortable
+   tap target, and iOS Safari zooms the page when a focused field is under
+   16px. Both are scoped to coarse pointers so mouse layouts are untouched. */
+@media (pointer: coarse) {
+  .nav-link { min-height: 44px; }
+  .small-action { min-height: 34px; padding: 0 10px; }
+  .page-button { width: 32px; height: 32px; }
+  .icon-button, .signout-button { width: 36px; height: 36px; }
+  .topbar-icon, .mobile-toggle { width: 38px; height: 38px; }
+  .password-toggle { width: 36px; height: 36px; }
+  .checkbox-option { padding: 9px 8px; }
+  .segmented-tab { padding: 10px 13px; }
+}
+@media (pointer: coarse) and (max-width: 680px) {
+  .text-input, .select-input, .textarea-input { font-size: 16px; }
+  .form-field .text-input, .form-field .select-input { min-height: 44px; font-size: 16px; }
+  .form-field .textarea-input { font-size: 16px; }
+  .search-box input { min-height: 40px; font-size: 16px; }
+  .filter-select { min-height: 40px; font-size: 16px; }
+  .role-select { min-height: 32px; max-width: 150px; }
+}
+
+/* Horizontally scrolled tables: keep momentum scrolling on iOS and stop the
+   gesture chaining to the page once the table hits its end. */
+.table-scroll { -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }
+
+/* Short landscape viewports (phones turned sideways): the sticky topbar plus a
+   centred dialog left almost no room for the dialog body. */
+@media (max-height: 520px) and (orientation: landscape) {
+  .modal-backdrop { align-items: start; padding: 10px; }
+  .modal-card { max-height: calc(100dvh - 20px); }
+  .auth-copy { margin: 26px 0 20px; }
+  .auth-footnote { margin-top: 26px; }
+  .chart-wrap { height: 180px; }
+}
