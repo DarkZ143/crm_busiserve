@@ -71,6 +71,10 @@ a { color: inherit; text-decoration: none; }
 .form-helper { margin: 2px 0 0; color: #89928b; font-size: 11px; line-height: 1.5; text-align: center; }
 .auth-footnote { margin-top: 56px; color: #969e97; font-size: 10px; text-align: center; }
 .auth-footnote span { padding: 0 6px; color: #bdc4bd; }
+.auth-policy-links { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0 6px; margin-top: 10px; font-size: 10px; }
+.auth-policy-links span { color: #bdc4bd; }
+.auth-policy-links a { color: #969e97; }
+.auth-policy-links a:hover { color: var(--ink-soft); text-decoration: underline; }
 .form-error { border: 1px solid #f0d5d5; border-radius: 7px; background: #fff8f8; padding: 10px 12px; color: #a63e3e; font-size: 12px; line-height: 1.45; }
 .notice { display: flex; align-items: flex-start; gap: 9px; border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 12px; line-height: 1.45; }
 .notice-warning { border-color: #f0dfc8; background: #fffaf3; color: #8b5c24; }
@@ -354,7 +358,7 @@ a { color: inherit; text-decoration: none; }
 .status-pending, .status-rejected { background: #fff7eb; color: #895d26; }
 .eyebrow, .brand-wordmark, .sidebar-brand .brand-wordmark { font-size: 12px; }
 .aside-kicker, .aside-caption, .aside-bottom { font-size: 12px; }
-.auth-footnote, .setup-instructions code, .page-loading { font-size: 12px; }
+.auth-footnote, .auth-policy-links, .setup-instructions code, .page-loading { font-size: 12px; }
 .form-helper { color: #68756b; font-size: 13px; }
 .button-danger { background: #a3403c; color: #fff; }
 .button-danger:not(:disabled):hover { background: #8f3532; transform: translateY(-1px); }
