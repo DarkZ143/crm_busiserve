@@ -12,6 +12,7 @@ const homeByRole: Record<Role, string> = {
   cto: "/cto/projects",
   product_manager: "/product-manager/projects",
   team_member: "/workspace/projects",
+  intern: "/workspace/tasks",
 };
 
 export default function HomePage() {

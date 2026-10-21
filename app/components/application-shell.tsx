@@ -11,6 +11,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { BrandWordmark } from "@/app/components/auth-layout";
+import { LiveRefresh } from "@/app/components/live-refresh";
 import type { RecordData, Role, SessionUser } from "@/lib/types";
 
 type NavLink = { label: string; href: string; icon: LucideIcon };
@@ -40,7 +41,18 @@ const navigation: Record<Role, NavLink[]> = {
   ],
   team_member: [
     { label: "My projects", href: "/workspace/projects", icon: FolderKanban },
+    { label: "Tasks", href: "/workspace/tasks", icon: ListTodo },
+    { label: "Interns", href: "/workspace/interns", icon: GraduationCap },
+    { label: "My teams", href: "/workspace/teams", icon: UsersRound },
     { label: "Work report", href: "/workspace/daily-reports", icon: ClipboardCheck },
+    { label: "Settings", href: "/workspace/settings", icon: Settings },
+  ],
+  intern: [
+    { label: "Dashboard", href: "/workspace/dashboard", icon: LayoutDashboard },
+    { label: "My tasks", href: "/workspace/tasks", icon: ListTodo },
+    { label: "My projects", href: "/workspace/projects", icon: FolderKanban },
+    { label: "Work report", href: "/workspace/daily-reports", icon: ClipboardCheck },
+    { label: "Report history", href: "/workspace/history", icon: FileClock },
     { label: "Settings", href: "/workspace/settings", icon: Settings },
   ],
 };
@@ -50,6 +62,7 @@ const roleLabel: Record<Role, string> = {
   cto: "Chief Technology Officer",
   product_manager: "Product Manager",
   team_member: "Team member",
+  intern: "Intern",
 };
 
 function initials(name: string) {
@@ -92,6 +105,8 @@ export function ApplicationShell({
 
   return (
     <div className="workspace-shell">
+      {/* Work assigned or reviewed elsewhere reaches this page without the reader doing anything. */}
+      <LiveRefresh />
       <button className={`mobile-scrim ${menuOpen ? "open" : ""}`} type="button" aria-label="Close navigation" onClick={() => setMenuOpen(false)} />
       <aside className={`sidebar ${menuOpen ? "open" : ""}`}>
         <div className="sidebar-brand"><BrandWordmark /></div>
@@ -113,7 +128,7 @@ export function ApplicationShell({
           <div className="profile-copy">
             <div className="profile-name" title={user.displayName}>{user.displayName}</div>
             <div className="profile-role">{user.designation || roleLabel[user.role]}</div>
-            <div className="profile-id" title={`User ID: ${user.uid}`}>ID: {user.uid}</div>
+            <div className="profile-id" title={user.internId ? `Intern ID: ${user.internId}` : `User ID: ${user.uid}`}>ID: {user.internId ?? user.uid}</div>
           </div>
           <button className="signout-button" type="button" onClick={logout} disabled={signingOut} title="Sign out" aria-label="Sign out">
             <LogOut size={15} />

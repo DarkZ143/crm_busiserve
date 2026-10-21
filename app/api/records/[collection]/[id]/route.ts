@@ -3,15 +3,24 @@ import { FieldValue } from "firebase-admin/firestore";
 import { z } from "zod";
 import { adminAuth, adminDb, hasAuthApiKey } from "@/lib/firebase-admin";
 import { requireSessionUser } from "@/lib/auth";
+import { isWorkspaceMember } from "@/lib/access-control";
 import { addAuditToBatch, auditEntry, createNotification, getRecord, listRecords, notifyRole } from "@/lib/data";
 import { assertSameOrigin, errorResponse, HttpError, parseBody, serializeRecord } from "@/lib/http";
 import { consumeRateLimit } from "@/lib/security";
-import { directTeamOf, isProjectReviewable, projectsHrefForRole, teamMemberSummary, type ProjectTeamMember } from "@/lib/project-approval";
-import { assertTeamsExist, deleteIntern, deleteTeam, setProjectTeams, updateIntern, updateTeam } from "@/lib/interns-teams";
+import { checkPhone, phoneError, PHONE_INPUT_MAX } from "@/lib/phone";
+import { directTeamOf, isProjectReviewable, projectsHrefForRole, stringArray, teamMemberSummary, type ProjectTeamMember } from "@/lib/project-approval";
+import { assertTeamsExist, canEmployeeManageIntern, deleteIntern, deleteTeam, setProjectTeams, updateIntern, updateTeam } from "@/lib/interns-teams";
 import { resyncProjectsForUser, syncProjectAssignments } from "@/lib/assignments";
 import type { CollectionName } from "@/lib/types";
 
 const collections: CollectionName[] = ["clients", "projects", "projectRequests", "tasks", "milestones", "workReports", "notifications", "auditLogs", "users", "interns", "teams"];
+/**
+ * Record types with an update anyone other than a Super Admin can make: a team member or intern moving
+ * their own task along or revising their own report, a CTO reviewing one, an employee editing an intern
+ * they took on, and marking a notification read.
+ * Every handler checks the role and the record again; this list only decides which ones are reachable.
+ */
+const sharedUpdateCollections: CollectionName[] = ["tasks", "workReports", "notifications", "interns"];
 const requestReviewSchema = z.object({
   action: z.enum(["approve", "request_changes", "reject"]),
   reviewerComments: z.string().trim().max(4000).optional().default(""),
@@ -52,11 +61,21 @@ const projectUpdateSchema = z.object({
   path: ["progressPercentage"],
 });
 const clientUpdateSchema = z.object({
+  // A Super Admin can revisit an approval here, not only through the one-time review dialog.
+  approvalStatus: z.enum(["pending", "approved", "rejected"]).optional(),
+  approvalComments: z.string().trim().max(4000).optional(),
   clientName: z.string().trim().min(2).max(160).optional(),
   contactPerson: z.string().trim().max(120).optional(),
   projectName: z.string().trim().min(2).max(160).optional(),
   officialEmail: z.email().max(254).transform((value) => value.trim().toLowerCase()).optional(),
-  contactNumber: z.string().trim().min(7).max(24).optional(),
+  // Same Indian-mobile rule as everywhere else, and stored as the ten digits however it was typed.
+  contactNumber: z.string().trim().min(1).max(PHONE_INPUT_MAX)
+    .superRefine((value, ctx) => {
+      const message = phoneError(value);
+      if (message) ctx.addIssue({ code: "custom", message });
+    })
+    .transform((value) => { const result = checkPhone(value); return result.ok ? result.phone : value; })
+    .optional(),
   companyName: z.string().trim().max(160).optional(),
   businessAddress: z.string().trim().max(500).optional(),
   industry: z.string().trim().max(100).optional(),
@@ -224,10 +243,14 @@ async function updateReport(id: string, request: Request, user: Awaited<ReturnTy
   const current = reportSnapshot.data()!;
 
   if (operation === "review") {
-    if (user.role !== "super_admin" && user.role !== "cto") throw new HttpError("You cannot review work reports.", 403);
+    if (user.role !== "super_admin" && user.role !== "cto" && user.role !== "team_member") throw new HttpError("You cannot review work reports.", 403);
     const input = await parseBody(request, reportReviewSchema);
     const project = await db.collection("projects").doc(String(current.projectId)).get();
     if (!project.exists || (user.role === "cto" && project.data()?.assignedCto !== user.uid)) throw new HttpError("This report is outside your project scope.", 403);
+    // An employee reviews the interns they took on, or who share one of their teams — nobody else.
+    if (user.role === "team_member" && !(await canEmployeeManageIntern(user.uid, String(current.employeeId ?? "")))) {
+      throw new HttpError("You can only review work reports from interns you manage.", 403);
+    }
     if (current.status === "accepted") throw new HttpError("Accepted reports cannot be changed.", 409);
     const batch = db.batch();
     batch.update(ref, {
@@ -246,7 +269,7 @@ async function updateReport(id: string, request: Request, user: Awaited<ReturnTy
   }
 
   if (operation === "revise") {
-    if (user.role !== "team_member" || current.employeeId !== user.uid) throw new HttpError("You can revise only your own reports.", 403);
+    if (!isWorkspaceMember(user.role) || current.employeeId !== user.uid) throw new HttpError("You can revise only your own reports.", 403);
     if (current.status !== "changes_requested") throw new HttpError("Only reports with requested changes can be revised.", 409);
     const input = await parseBody(request, reportRevisionSchema);
     const revisionRef = ref.collection("revisions").doc();
@@ -290,13 +313,52 @@ async function updateTask(id: string, request: Request, user: Awaited<ReturnType
   const current = task.data()!;
   const project = projects.find((record) => record.id === current.projectId);
   if (!project) throw new HttpError("This task is outside your project scope.", 403);
-  if (user.role === "team_member" && current.assigneeId !== user.uid) throw new HttpError("You can update only your assigned tasks.", 403);
-  if (user.role !== "team_member" && user.role !== "cto" && user.role !== "super_admin") throw new HttpError("You cannot update this task.", 403);
+  if (isWorkspaceMember(user.role) && current.assigneeId !== user.uid) throw new HttpError("You can update only your assigned tasks.", 403);
+  if (!isWorkspaceMember(user.role) && user.role !== "cto" && user.role !== "super_admin") throw new HttpError("You cannot update this task.", 403);
   const batch = db.batch();
   batch.update(ref, { status: input.status, ...(input.comment ? { latestComment: input.comment, latestCommentBy: user.uid, latestCommentAt: FieldValue.serverTimestamp() } : {}), updatedAt: FieldValue.serverTimestamp() });
   addAuditToBatch(batch, user, "task_updated", "tasks", id, { status: input.status });
   await batch.commit();
   return { id, status: input.status };
+}
+
+/**
+ * Removes a task that was assigned by mistake. A task somebody has already reported work against is part
+ * of that report's context, so it is kept and closed rather than deleted.
+ */
+async function deleteTask(id: string, user: Awaited<ReturnType<typeof requireSessionUser>>) {
+  if (user.role !== "super_admin" && user.role !== "cto" && user.role !== "team_member") {
+    throw new HttpError("You cannot delete tasks.", 403);
+  }
+  const db = adminDb();
+  const ref = db.collection("tasks").doc(id);
+  const task = await ref.get();
+  if (!task.exists) throw new HttpError("Task not found.", 404);
+  const current = task.data()!;
+  if (user.role === "team_member" && current.createdBy !== user.uid) {
+    throw new HttpError("You can only delete tasks you assigned yourself.", 403);
+  }
+  if (user.role === "cto") {
+    const project = await db.collection("projects").doc(String(current.projectId)).get();
+    if (!project.exists || project.data()?.assignedCto !== user.uid) throw new HttpError("This task is outside your project scope.", 403);
+  }
+  const reports = await db.collection("workReports").where("taskId", "==", id).limit(1).get();
+  if (!reports.empty) {
+    throw new HttpError("Work has already been reported against this task, so it cannot be deleted. Mark it completed or blocked instead.", 409);
+  }
+  const batch = db.batch();
+  batch.delete(ref);
+  addAuditToBatch(batch, user, "task_deleted", "tasks", id, {
+    projectId: String(current.projectId ?? ""),
+    title: String(current.title ?? ""),
+    assigneeId: String(current.assigneeId ?? ""),
+  });
+  await batch.commit();
+  const assignee = String(current.assigneeId ?? "");
+  if (assignee && assignee !== user.uid) {
+    void createNotification(assignee, "Task removed", `${String(current.title ?? "A task")} is no longer assigned to you.`, "/workspace/tasks", "task_deleted").catch(() => undefined);
+  }
+  return { id, deleted: true };
 }
 
 async function updateProject(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
@@ -448,9 +510,10 @@ async function reviewProject(id: string, request: Request, user: Awaited<ReturnT
     }));
   });
 
-  if (teamIds.length) {
-    // Linking teams adds their members through the shared recompute, which notifies them.
-    await setProjectTeams(id, teamIds);
+  if (approve) {
+    // Linking teams adds their members through the shared recompute, which also brings in any intern
+    // already assigned to this project and notifies everyone who joined.
+    if (teamIds.length) await setProjectTeams(id, teamIds);
     await syncProjectAssignments([id]);
   }
 
@@ -480,6 +543,61 @@ async function reviewProject(id: string, request: Request, user: Awaited<ReturnT
   return { id, ...changes, reviewedAt: null, updatedAt: null };
 }
 
+/** Linked records read in one pass when a project is deleted. Past this, deleting would need several batches. */
+const PROJECT_CLEANUP_LIMIT = 200;
+
+/**
+ * Deletes a project together with the planning records that only exist to describe it, and unlinks it
+ * from the teams, interns, and project request that point at it.
+ *
+ * Submitted work reports are people's own record of what they did, so a project that has any is refused
+ * rather than quietly taking them down with it. Archiving is the way to retire that kind of project.
+ */
+async function deleteProject(id: string, user: Awaited<ReturnType<typeof requireSessionUser>>) {
+  if (user.role !== "super_admin") throw new HttpError("Only a Super Admin can delete a project.", 403);
+  const db = adminDb();
+  const ref = db.collection("projects").doc(id);
+  const [project, reports, tasks, milestones, teams, interns, requests] = await Promise.all([
+    ref.get(),
+    db.collection("workReports").where("projectId", "==", id).limit(1).get(),
+    db.collection("tasks").where("projectId", "==", id).limit(PROJECT_CLEANUP_LIMIT + 1).get(),
+    db.collection("milestones").where("projectId", "==", id).limit(PROJECT_CLEANUP_LIMIT + 1).get(),
+    db.collection("teams").where("projectIds", "array-contains", id).get(),
+    db.collection("interns").where("projectIds", "array-contains", id).get(),
+    db.collection("projectRequests").where("projectId", "==", id).get(),
+  ]);
+  if (!project.exists) throw new HttpError("Project not found.", 404);
+  const current = project.data()!;
+  if (!reports.empty) {
+    throw new HttpError("Work reports have been submitted for this project, so deleting it would take that history with it. Set its status to cancelled or archived instead.", 409);
+  }
+  if (tasks.size > PROJECT_CLEANUP_LIMIT || milestones.size > PROJECT_CLEANUP_LIMIT) {
+    throw new HttpError("This project has too many tasks or milestones to delete in one step. Set its status to archived instead.", 409);
+  }
+  const batch = db.batch();
+  for (const task of tasks.docs) batch.delete(task.ref);
+  for (const milestone of milestones.docs) batch.delete(milestone.ref);
+  for (const team of teams.docs) batch.update(team.ref, { projectIds: FieldValue.arrayRemove(id), updatedAt: FieldValue.serverTimestamp() });
+  for (const intern of interns.docs) batch.update(intern.ref, { projectIds: FieldValue.arrayRemove(id), updatedAt: FieldValue.serverTimestamp() });
+  // An approved request becomes convertible again rather than pointing at a project that is gone.
+  for (const linked of requests.docs) batch.update(linked.ref, { projectId: FieldValue.delete(), convertedAt: null, updatedAt: FieldValue.serverTimestamp() });
+  batch.delete(ref);
+  addAuditToBatch(batch, user, "project_deleted", "projects", id, {
+    name: String(current.name ?? ""),
+    clientId: String(current.clientId ?? ""),
+    deletedTasks: tasks.size,
+    deletedMilestones: milestones.size,
+    unlinkedTeams: teams.docs.map((team) => team.id),
+    unlinkedInterns: interns.docs.map((intern) => intern.id),
+  });
+  await batch.commit();
+  const name = String(current.name ?? "a project");
+  for (const uid of stringArray(current.assignedTeam)) {
+    void createNotification(uid, "Project removed", `${name} is no longer in the workspace.`, "/workspace/projects", "project_deleted").catch(() => undefined);
+  }
+  return { id, deleted: true };
+}
+
 async function updateMilestone(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
   if (user.role !== "super_admin" && user.role !== "cto") throw new HttpError("Only a CTO or Super Admin can update milestones.", 403);
   const input = await parseBody(request, milestoneUpdateSchema);
@@ -507,6 +625,12 @@ async function updateClient(id: string, request: Request, user: Awaited<ReturnTy
   if (user.role === "product_manager" && input.assignedProductManager !== undefined) throw new HttpError("You cannot reassign this client.", 403);
   if (user.role !== "super_admin" && input.status !== undefined) throw new HttpError("Only a Super Admin can change client status.", 403);
   if (user.role !== "super_admin" && input.internalNotes !== undefined) throw new HttpError("Only a Super Admin can edit internal notes.", 403);
+  if (user.role !== "super_admin" && (input.approvalStatus !== undefined || input.approvalComments !== undefined)) {
+    throw new HttpError("Only a Super Admin can change a client's approval.", 403);
+  }
+  if (input.approvalStatus === "rejected" && !(input.approvalComments ?? String(current.data()?.approvalComments ?? "")).trim()) {
+    throw new HttpError("Add a review note so the submitter knows why this client was not approved.", 400);
+  }
   if (input.assignedProductManager) {
     const manager = await db.collection("users").doc(input.assignedProductManager).get();
     if (!manager.exists || manager.data()?.role !== "product_manager" || manager.data()?.accountStatus !== "active") {
@@ -514,14 +638,19 @@ async function updateClient(id: string, request: Request, user: Awaited<ReturnTy
     }
   }
   const changes = Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
+  // A change of approval is a review, so it is stamped like one. A client that is no longer approved
+  // cannot stay active, because an active client is what projects are allowed to be raised against.
+  const reviewed = input.approvalStatus !== undefined && input.approvalStatus !== current.data()?.approvalStatus;
   const update = {
     ...changes,
     ...(input.officialEmail ? { officialEmailNormalized: input.officialEmail } : {}),
+    ...(reviewed ? { reviewedBy: user.uid, reviewedAt: FieldValue.serverTimestamp() } : {}),
+    ...(input.approvalStatus && input.approvalStatus !== "approved" ? { status: "draft" } : {}),
     updatedAt: FieldValue.serverTimestamp(),
   };
   const batch = db.batch();
   batch.update(ref, update);
-  addAuditToBatch(batch, user, "client_updated", "clients", id, { changedFields: Object.keys(changes) });
+  addAuditToBatch(batch, user, reviewed ? `client_${input.approvalStatus}` : "client_updated", "clients", id, { changedFields: Object.keys(changes) });
   await batch.commit();
   return { id, ...changes };
 }
@@ -618,6 +747,11 @@ async function updateUser(id: string, request: Request, user: Awaited<ReturnType
   if (!snapshot.exists) throw new HttpError("User not found.", 404);
   const current = snapshot.data()!;
   if (current.deletionPending) throw new HttpError("This account is being deleted. Retry the delete action to finish.", 409);
+  // An intern sign-in follows their intern record, so its role and access are managed from the Interns page.
+  // An intern's role comes from their intern record, so only their access can be changed from here.
+  if (current.role === "intern" && input.operation === "change_role") {
+    throw new HttpError("An intern's role follows their intern record. Change it from the Interns page.", 409);
+  }
   if (input.operation === "set_status" && !input.accountStatus) throw new HttpError("Choose an account status.", 400);
   if (input.operation === "change_role" && !input.role) throw new HttpError("Choose a role.", 400);
   const nextRole = input.role ?? current.role;
@@ -684,16 +818,41 @@ async function verifySuperAdminPassword(password: string, user: Awaited<ReturnTy
   throw new HttpError("Password verification could not be completed. Try again.", 503);
 }
 
-async function deleteTeamMember(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
-  if (user.role !== "super_admin") throw new HttpError("Only a Super Admin can delete team members.", 403);
+/**
+ * Refuses to delete an account that still leads work, because the records pointing at it would be left
+ * with an owner who no longer exists. The Super Admin reassigns that work first.
+ */
+async function assertNothingDependsOnUser(uid: string, role: string) {
+  const db = adminDb();
+  if (role === "cto") {
+    const projects = await db.collection("projects").where("assignedCto", "==", uid).limit(1).get();
+    if (!projects.empty) throw new HttpError("This CTO still leads at least one project. Reassign those projects before deleting the account.", 409);
+  }
+  if (role === "product_manager") {
+    const [projects, clients] = await Promise.all([
+      db.collection("projects").where("assignedProductManager", "==", uid).limit(1).get(),
+      db.collection("clients").where("assignedProductManager", "==", uid).limit(1).get(),
+    ]);
+    if (!projects.empty || !clients.empty) {
+      throw new HttpError("This Product Manager is still assigned to a client or project. Reassign those records before deleting the account.", 409);
+    }
+  }
+}
+
+async function deleteWorkspaceUser(id: string, request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
+  if (user.role !== "super_admin") throw new HttpError("Only a Super Admin can delete accounts.", 403);
   if (id === user.uid) throw new HttpError("You cannot delete your own account.", 403);
   const input = await parseBody(request, userDeleteSchema);
   const db = adminDb();
   const profileRef = db.collection("users").doc(id);
   const initialProfile = await profileRef.get();
-  if (!initialProfile.exists) throw new HttpError("Team member not found.", 404);
-  if (initialProfile.data()?.role !== "team_member") throw new HttpError("Only a team member account can be deleted here.", 403);
+  if (!initialProfile.exists) throw new HttpError("User not found.", 404);
+  const role = String(initialProfile.data()?.role ?? "");
+  // A Super Admin account has to be demoted on purpose first, so the workspace is never left without one.
+  if (role === "super_admin") throw new HttpError("Change this account's role before deleting it, so the workspace is never left without a Super Admin.", 409);
 
+  // Checked before the password, so a blocked delete does not spend one of the hour's five attempts.
+  await assertNothingDependsOnUser(id, role);
   await verifySuperAdminPassword(input.password, user);
 
   const existingStatus = String(initialProfile.data()?.accountStatus ?? "active");
@@ -703,8 +862,8 @@ async function deleteTeamMember(id: string, request: Request, user: Awaited<Retu
   }
   await db.runTransaction(async (transaction) => {
     const latest = await transaction.get(profileRef);
-    if (!latest.exists) throw new HttpError("Team member not found.", 404);
-    if (latest.data()?.role !== "team_member") throw new HttpError("Only a team member account can be deleted here.", 403);
+    if (!latest.exists) throw new HttpError("User not found.", 404);
+    if (latest.data()?.role !== role) throw new HttpError("This account's role changed while it was being deleted. Refresh and try again.", 409);
     if (latest.data()?.deletionPending && !wasAlreadyPending) throw new HttpError("This account is already being deleted. Retry the delete action shortly.", 409);
     if (!latest.data()?.deletionPending) {
       transaction.update(profileRef, {
@@ -727,27 +886,34 @@ async function deleteTeamMember(id: string, request: Request, user: Awaited<Retu
           updatedAt: FieldValue.serverTimestamp(),
         }).catch(() => undefined);
       }
-      throw new HttpError("The team member account could not be deleted. Try again.", 503);
+      throw new HttpError("The account could not be deleted. Try again.", 503);
     }
   }
 
   const retiredIdRef = db.collection("deletedUserIds").doc(id);
   const auditRef = db.collection("auditLogs").doc();
+  // Deleting an intern's account only takes away their sign-in. The intern record stays on the Interns
+  // page, without a login, and a new password there gives them a fresh one.
+  const internRecord = role === "intern"
+    ? (await db.collection("interns").where("loginUid", "==", id).limit(1).get()).docs[0]
+    : undefined;
   await db.runTransaction(async (transaction) => {
     const latest = await transaction.get(profileRef);
-    if (!latest.exists) throw new HttpError("Team member not found.", 404);
-    if (latest.data()?.role !== "team_member" || !latest.data()?.deletionPending) {
+    if (!latest.exists) throw new HttpError("User not found.", 404);
+    if (latest.data()?.role !== role || !latest.data()?.deletionPending) {
       throw new HttpError("The account changed while it was being deleted. Refresh and try again.", 409);
     }
+    if (internRecord) transaction.update(internRecord.ref, { loginUid: "", updatedAt: FieldValue.serverTimestamp() });
     transaction.delete(profileRef);
     transaction.set(retiredIdRef, {
       deletedAt: FieldValue.serverTimestamp(),
       deletedBy: user.uid,
     });
     transaction.set(auditRef, auditEntry(user, "user_deleted", "users", id, {
-      role: "team_member",
+      role,
       displayName: String(latest.data()?.displayName ?? ""),
       email: String(latest.data()?.email ?? ""),
+      ...(internRecord ? { internId: internRecord.id, internRecordKept: true } : {}),
     }));
   });
   // Take the deleted account out of its teams and refresh every project it was on.
@@ -761,7 +927,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ colle
     const user = await requireSessionUser();
     const { collection: rawCollection, id } = await context.params;
     const collection = ensureCollection(rawCollection);
-    if (user.role !== "super_admin") {
+    if (user.role !== "super_admin" && !sharedUpdateCollections.includes(collection)) {
       throw new HttpError("Only a Super Admin can update workspace records.", 403);
     }
     let result;
@@ -772,10 +938,15 @@ export async function PATCH(request: Request, context: { params: Promise<{ colle
           : await reviewRequest(id, request, user);
     }
     else if (collection === "workReports") result = await updateReport(id, request, user);
-    else if (collection === "tasks") result = await updateTask(id, request, user);
+    else if (collection === "tasks") {
+      const operation = (await parseBody(request.clone(), z.object({ operation: z.string().optional() }))).operation;
+      result = operation === "delete" ? await deleteTask(id, user) : await updateTask(id, request, user);
+    }
     else if (collection === "projects") {
       const operation = (await parseBody(request.clone(), z.object({ operation: z.string().optional() }))).operation;
-      result = operation === "review" ? await reviewProject(id, request, user) : await updateProject(id, request, user);
+      result = operation === "review" ? await reviewProject(id, request, user)
+        : operation === "delete" ? await deleteProject(id, user)
+          : await updateProject(id, request, user);
     }
     else if (collection === "milestones") result = await updateMilestone(id, request, user);
     else if (collection === "interns" || collection === "teams") {
@@ -791,7 +962,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ colle
     }
     else if (collection === "users") {
       const operation = (await parseBody(request.clone(), z.object({ operation: z.string().optional() }))).operation;
-      result = operation === "delete" ? await deleteTeamMember(id, request, user) : await updateUser(id, request, user);
+      result = operation === "delete" ? await deleteWorkspaceUser(id, request, user) : await updateUser(id, request, user);
     }
     else if (collection === "notifications") {
       const input = await parseBody(request, notificationUpdateSchema);

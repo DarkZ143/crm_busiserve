@@ -3,6 +3,7 @@ export const ROLES = [
   "cto",
   "product_manager",
   "team_member",
+  "intern",
 ] as const;
 
 export type Role = (typeof ROLES)[number];
@@ -34,6 +35,8 @@ export interface SessionUser {
   role: Role;
   accountStatus: AccountStatus;
   designation?: string;
+  /** Set on intern logins: the intern record this account belongs to, such as BSITS-001. */
+  internId?: string;
 }
 
 export interface RecordData {
@@ -45,6 +48,8 @@ export interface TeamWorkSummary {
   uid: string;
   displayName: string;
   designation: string;
+  /** Interns file work reports too, so a summary row says which kind of account it belongs to. */
+  role: Extract<Role, "team_member" | "intern">;
   accountStatus: AccountStatus;
   reportCount: number;
   hoursLogged: number;

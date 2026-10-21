@@ -5,9 +5,10 @@ import { ApplicationShell } from "@/app/components/application-shell";
 import { DashboardContent } from "@/app/components/dashboard-content";
 import { WorkspaceLoader } from "@/app/components/workspace-loader";
 import { WorkspaceSection } from "@/app/components/workspace-section";
-import { canAccessArea } from "@/lib/access-control";
+import { canAccessArea, isWorkspaceMember } from "@/lib/access-control";
 import { getSessionUser } from "@/lib/auth";
-import { dateInTimezone, getCompanyTimezone, getDashboardRecords, getTeamWorkSummary, listRecords } from "@/lib/data";
+import { dateInTimezone, getCompanyTimezone, getDashboardRecords, getInternWorkRecords, getOwnInternRecord, getTeamDirectory, getTeamWorkSummary, listAssignableInterns, listRecords } from "@/lib/data";
+import type { RecordData } from "@/lib/types";
 import { isFirebaseConfigured } from "@/lib/firebase-admin";
 import type { CollectionName, Role, SessionUser } from "@/lib/types";
 
@@ -18,6 +19,7 @@ const roleHome: Record<Role, string> = {
   cto: "/cto/projects",
   product_manager: "/product-manager/projects",
   team_member: "/workspace/projects",
+  intern: "/workspace/dashboard",
 };
 
 const titleBySection: Record<string, string> = {
@@ -59,7 +61,10 @@ function sectionCollection(section: string): CollectionName | null {
 }
 
 function allowedSection(area: string, section: string, role: Role) {
-  if (role === "team_member") return area === "workspace" && ["projects", "daily-reports", "settings"].includes(section);
+  // An intern works out of the same area as a team member, and also has their own task list.
+  if (role === "intern") return area === "workspace" && ["dashboard", "tasks", "projects", "daily-reports", "history", "settings"].includes(section);
+  // A full-time employee also takes on interns and hands them tasks on their own projects.
+  if (role === "team_member") return area === "workspace" && ["projects", "tasks", "interns", "teams", "daily-reports", "settings"].includes(section);
   if (role !== "super_admin") return section === "clients" || section === "projects";
   const common = ["dashboard"];
   const areas: Record<string, string[]> = {
@@ -93,13 +98,16 @@ async function WorkspaceRouteContent({ params }: PageParameters) {
   if (!allowedSection(area, section, user.role)) notFound();
   if (nestedAction === "new" && user.role !== "super_admin" && section !== "clients" && section !== "projects") notFound();
 
+  // What a section is called depends on who is looking: the same page is "Interns" to a Super Admin
+  // looking across the company, and "My projects" or "My teams" to the person doing the work.
+  const ownTitle = isWorkspaceMember(user.role) && section === "projects" ? "My projects"
+    : user.role === "team_member" && section === "teams" ? "My teams"
+      : user.role === "intern" && section === "tasks" ? "My tasks"
+        : isWorkspaceMember(user.role) && section === "settings" ? "Settings"
+          : "";
   const title = nestedAction === "new"
     ? `New ${titleBySection[section]?.toLowerCase() ?? "record"}`
-    : user.role === "team_member" && section === "projects"
-      ? "My projects"
-      : user.role === "team_member" && section === "settings"
-        ? "Settings"
-        : titleBySection[section];
+    : ownTitle || titleBySection[section];
   if (!title) notFound();
 
   if (section === "dashboard" || section === "analytics") {
@@ -109,13 +117,14 @@ async function WorkspaceRouteContent({ params }: PageParameters) {
   }
 
   const collection = sectionCollection(section);
-  const [allRecords, auxiliary, timezone, teamWorkSummary] = await Promise.all([
+  const [allRecords, timezone, teamWorkSummary] = await Promise.all([
     collection ? listRecords(collection, user) : Promise.resolve([]),
-    getAuxiliaryRecords(section, user),
     getCompanyTimezone(),
     section === "reports" && user.role === "super_admin" ? getTeamWorkSummary() : Promise.resolve([]),
   ]);
   const records = section === "employees" ? allRecords.filter((record) => record.role === "team_member") : allRecords;
+  // Reads after the rows, because the intern detail view needs the sign-ins of the interns actually listed.
+  const auxiliary = await getAuxiliaryRecords(section, user, records);
   return (
     <ApplicationShell user={user} title={title} section={section} notifications={auxiliary.notifications}>
       <WorkspaceSection
@@ -133,16 +142,16 @@ async function WorkspaceRouteContent({ params }: PageParameters) {
   );
 }
 
-async function getAuxiliaryRecords(section: string, user: SessionUser) {
-  const empty: Record<"clients" | "projects" | "tasks" | "users" | "requests" | "notifications" | "interns" | "teams", Awaited<ReturnType<typeof listRecords>>> = {
-    clients: [], projects: [], tasks: [], users: [], requests: [], notifications: [], interns: [], teams: [],
+async function getAuxiliaryRecords(section: string, user: SessionUser, records: RecordData[]) {
+  const empty: Record<"clients" | "projects" | "tasks" | "users" | "requests" | "notifications" | "interns" | "teams" | "internTasks" | "internReports", Awaited<ReturnType<typeof listRecords>>> = {
+    clients: [], projects: [], tasks: [], users: [], requests: [], notifications: [], interns: [], teams: [], internTasks: [], internReports: [],
   };
   const lookups: Record<string, (keyof typeof empty)[]> = {
     "project-requests": ["clients"],
     projects: user.role === "super_admin" ? ["clients", "requests", "users", "teams"] : ["clients"],
-    interns: ["projects", "teams", "users"],
+    interns: user.role === "super_admin" ? ["projects", "teams", "users"] : ["projects"],
     employees: ["interns", "teams"],
-    teams: ["projects", "users", "interns"],
+    teams: user.role === "super_admin" ? ["projects", "users", "interns"] : ["projects"],
     tasks: ["projects", "users"],
     "daily-reports": ["projects", "tasks"],
     milestones: ["projects"],
@@ -156,10 +165,29 @@ async function getAuxiliaryRecords(section: string, user: SessionUser) {
   };
   const keys = lookups[section] ?? [];
   const collectionByKey: Record<keyof typeof empty, CollectionName> = {
-    clients: "clients", projects: "projects", tasks: "tasks", users: "users", requests: "projectRequests", notifications: "notifications", interns: "interns", teams: "teams",
+    clients: "clients", projects: "projects", tasks: "tasks", users: "users", requests: "projectRequests", notifications: "notifications", interns: "interns", teams: "teams", internTasks: "tasks", internReports: "workReports",
   };
   const pairs = await Promise.all(keys.map(async (key) => [key, await listRecords(collectionByKey[key], user)] as const));
   const result = { ...empty, notifications: user.role === "super_admin" ? await listRecords("notifications", user) : [] };
-  for (const [key, records] of pairs) result[key] = records;
+  for (const [key, found] of pairs) result[key] = found;
+  // The assignee picker offers every active intern who can sign in, with only the fields it needs.
+  if (section === "tasks") result.interns = await listAssignableInterns();
+  // The intern detail view reads the work filed against the interns already listed on this page.
+  if (section === "interns") {
+    const work = await getInternWorkRecords(records.map((record) => String(record.loginUid ?? "")));
+    result.internTasks = work.tasks;
+    result.internReports = work.reports;
+  }
+  // An intern's own page shows the details held on their intern record, which they cannot read directly.
+  if (section === "settings" && user.role === "intern") result.interns = await getOwnInternRecord(user.uid);
+  // Someone looking at their own team sees its roster, which they cannot read collection by collection.
+  if (section === "teams" && user.role !== "super_admin") {
+    const directory = await getTeamDirectory(records);
+    result.users = directory.members;
+    result.interns = directory.interns;
+    const work = await getInternWorkRecords(directory.interns.map((intern) => String(intern.loginUid ?? "")));
+    result.internTasks = work.tasks;
+    result.internReports = work.reports;
+  }
   return result;
 }

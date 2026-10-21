@@ -1,3 +1,4 @@
+import { isWorkspaceMember } from "@/lib/access-control";
 import type { Role, RecordData, CollectionName } from "@/lib/types";
 
 function without(record: RecordData, fields: string[]): RecordData {
@@ -19,7 +20,7 @@ export function redactRecordForRole(collection: CollectionName, record: RecordDa
   if (collection === "projects" && role === "product_manager") {
     return without(record, ["contractPrice", "currency", "budget", "internalFinancialNotes"]);
   }
-  if (collection === "projects" && role === "team_member") {
+  if (collection === "projects" && isWorkspaceMember(role)) {
     return without(record, ["contractPrice", "proposedPrice", "currency", "budget", "clientEmail", "clientPhone", "internalFinancialNotes"]);
   }
   if (collection === "workReports" && role === "product_manager") {

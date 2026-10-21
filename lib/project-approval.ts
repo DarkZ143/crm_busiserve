@@ -35,16 +35,21 @@ export function teamMemberSummary(uid: string, profile: Record<string, unknown> 
   };
 }
 
-export type ProjectInternSummary = { id: string; internId: string; fullName: string; role: string };
+export type ProjectInternSummary = { id: string; internId: string; fullName: string; role: string; loginUid: string };
 export type ProjectTeamSummary = { id: string; name: string };
 
-/** Interns have no login, so projects carry a small display summary (never contact details). */
+/**
+ * Projects carry a small display summary of their interns (never contact details), so a submitter who
+ * cannot read the interns collection still sees who is on the work. loginUid is empty for an intern
+ * without a workspace sign-in, and is what a task is assigned to for one who has it.
+ */
 export function internSummary(id: string, intern: Record<string, unknown> | undefined): ProjectInternSummary {
   return {
     id,
     internId: String(intern?.internId ?? id),
     fullName: String(intern?.fullName ?? id),
     role: String(intern?.role ?? ""),
+    loginUid: String(intern?.loginUid ?? ""),
   };
 }
 
