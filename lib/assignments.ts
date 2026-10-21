@@ -9,7 +9,8 @@ import { combineProjectMembers, directTeamOf, internSummary, stringArray, teamMe
  * Recomputes who is on each project from its direct assignments, its linked teams, and interns assigned to it.
  *
  * - assignedTeam (user IDs) drives what team members can see and which tasks and reports they can file, so team
- *   members get access to every project their team is linked to.
+ *   members get access to every project their team is linked to. An intern who has a workspace sign-in is
+ *   listed there too, so their own projects, tasks, and reports resolve exactly like a team member's.
  * - assignedTeamMembers, assignedTeams, and assignedInterns are display summaries for the project's submitter,
  *   who cannot read the users, teams, or interns collections.
  *
@@ -40,8 +41,14 @@ export async function syncProjectAssignments(projectIds: Iterable<string>) {
     ));
     const internIds = [...new Set([...directInterns.docs.map((doc) => doc.id), ...teamInternIds])];
     const internDocs = await Promise.all(internIds.map((id) => db.collection("interns").doc(id).get()));
+    const interns = internDocs.filter((doc) => doc.exists);
+    // An intern whose internship ended keeps their record on the project but loses workspace access.
+    const internLoginUids = interns
+      .filter((doc) => doc.data()?.status === "active")
+      .map((doc) => String(doc.data()?.loginUid ?? ""))
+      .filter(Boolean);
 
-    const assignedTeam = members.map((doc) => doc.id);
+    const assignedTeam = [...new Set([...members.map((doc) => doc.id), ...internLoginUids])];
     const previous = stringArray(data.assignedTeam);
     await ref.update({
       // Accounts that were deleted drop out; suspended direct members stay listed as chosen.
@@ -49,7 +56,7 @@ export async function syncProjectAssignments(projectIds: Iterable<string>) {
       assignedTeam,
       assignedTeamMembers: members.map((doc) => teamMemberSummary(doc.id, doc.data())),
       assignedTeams: teams.docs.map((team) => ({ id: team.id, name: String(team.data().name ?? "Team") })),
-      assignedInterns: internDocs.filter((doc) => doc.exists).map((doc) => internSummary(doc.id, doc.data())),
+      assignedInterns: interns.map((doc) => internSummary(doc.id, doc.data())),
       updatedAt: FieldValue.serverTimestamp(),
     });
 

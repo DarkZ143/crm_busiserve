@@ -85,7 +85,11 @@ describe("teams and interns on projects", () => {
 
   it("summarizes interns without contact details", () => {
     expect(internSummary("BUS-INT-1", { internId: "BUS-INT-1", fullName: "Riya", role: "QA intern", email: "r@example.com", phone: "999" }))
-      .toEqual({ id: "BUS-INT-1", internId: "BUS-INT-1", fullName: "Riya", role: "QA intern" });
+      .toEqual({ id: "BUS-INT-1", internId: "BUS-INT-1", fullName: "Riya", role: "QA intern", loginUid: "" });
+  });
+
+  it("carries the sign-in a task can be assigned to", () => {
+    expect(internSummary("BUS-INT-2", { internId: "BUS-INT-2", fullName: "Arjun", role: "Frontend intern", loginUid: "uid-9" }).loginUid).toBe("uid-9");
   });
 
   it("ignores malformed ID lists", () => {

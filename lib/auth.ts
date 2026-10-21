@@ -40,6 +40,7 @@ export async function getSessionUser(): Promise<SessionUser | null> {
       role: user.role as Role,
       accountStatus: "active",
       ...(user.designation ? { designation: String(user.designation) } : {}),
+      ...(user.internId ? { internId: String(user.internId) } : {}),
     };
   } catch {
     return null;

@@ -26,6 +26,13 @@ export function AuthLayout({ eyebrow, title, description, children }: {
           </div>
           {children}
           <div className="auth-footnote">Internal workspace <span>·</span> Secure access</div>
+          <nav className="auth-policy-links" aria-label="Company policies">
+            <a href="https://www.busiserve.in/privacy" target="_blank" rel="noreferrer">Privacy Policy</a>
+            <span aria-hidden="true">·</span>
+            <a href="https://www.busiserve.in/terms" target="_blank" rel="noreferrer">Terms &amp; Conditions</a>
+            <span aria-hidden="true">·</span>
+            <a href="https://www.busiserve.in/refund-policy" target="_blank" rel="noreferrer">Refund &amp; Cancellation Policy</a>
+          </nav>
         </div>
       </section>
       <aside className="auth-aside" aria-label="Platform overview">

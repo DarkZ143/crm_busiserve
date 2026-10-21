@@ -3,15 +3,25 @@ import { FieldValue } from "firebase-admin/firestore";
 import { z } from "zod";
 import { adminAuth, adminDb } from "@/lib/firebase-admin";
 import { requireSessionUser } from "@/lib/auth";
-import { canReadCollection } from "@/lib/access-control";
+import { canReadCollection, isWorkspaceMember } from "@/lib/access-control";
 import { addAuditToBatch, auditEntry, createNotification, listRecords, notifyRole } from "@/lib/data";
 import { redactRecordForRole } from "@/lib/record-security";
 import { canReadRecord } from "@/lib/access-control";
-import { teamMemberSummary } from "@/lib/project-approval";
-import { assertTeamsExist, createIntern, createTeam, setProjectTeams } from "@/lib/interns-teams";
+import { stringArray, teamMemberSummary } from "@/lib/project-approval";
+import { addInternToProject, assertTeamsExist, createIntern, createTeam, setProjectTeams } from "@/lib/interns-teams";
 import { syncProjectAssignments } from "@/lib/assignments";
 import { assertSameOrigin, errorResponse, HttpError, parseBody, serializeRecord } from "@/lib/http";
+import { checkPhone, phoneError, PHONE_INPUT_MAX } from "@/lib/phone";
 import type { CollectionName } from "@/lib/types";
+
+/** A client's contact number follows the same Indian-mobile rule as every other number here. */
+const contactNumberSchema = z.string().trim().min(1, "A contact number is required.").max(PHONE_INPUT_MAX)
+  .superRefine((value, ctx) => {
+    const message = phoneError(value);
+    if (message) ctx.addIssue({ code: "custom", message });
+  })
+  // Stored as the ten digits, however the person typed them.
+  .transform((value) => { const result = checkPhone(value); return result.ok ? result.phone : value; });
 
 const collectionNames: CollectionName[] = ["clients", "projects", "projectRequests", "tasks", "milestones", "workReports", "notifications", "auditLogs", "users", "interns", "teams"];
 const roles = ["super_admin", "cto", "product_manager", "team_member"] as const;
@@ -19,7 +29,7 @@ const roles = ["super_admin", "cto", "product_manager", "team_member"] as const;
 const clientSchema = z.object({
   // Required: client name, contact number, project name, and business address. Everything else is optional.
   clientName: z.string().trim().min(2).max(160),
-  contactNumber: z.string().trim().min(7).max(24),
+  contactNumber: contactNumberSchema,
   projectName: z.string().trim().min(2).max(160),
   businessAddress: z.string().trim().min(3).max(500),
   contactPerson: z.string().trim().max(120).optional().default(""),
@@ -344,7 +354,9 @@ async function submitProject(request: Request, user: Awaited<ReturnType<typeof r
 }
 
 async function createTask(request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
-  if (user.role !== "super_admin" && user.role !== "cto") throw new HttpError("Only a CTO or Super Admin can assign tasks.", 403);
+  if (user.role !== "super_admin" && user.role !== "cto" && user.role !== "team_member") {
+    throw new HttpError("You cannot assign tasks.", 403);
+  }
   const input = await parseBody(request, taskSchema);
   const db = adminDb();
   const [project, assignee] = await Promise.all([
@@ -352,13 +364,23 @@ async function createTask(request: Request, user: Awaited<ReturnType<typeof requ
     db.collection("users").doc(input.assigneeId).get(),
   ]);
   if (!project.exists || (user.role === "cto" && project.data()?.assignedCto !== user.uid)) throw new HttpError("The selected project is unavailable.", 404);
-  const assignedTeam = (project.data()?.assignedTeam ?? []) as string[];
-  if (!assignedTeam.includes(input.assigneeId) || !assignee.exists || assignee.data()?.role !== "team_member" || assignee.data()?.accountStatus !== "active") {
-    throw new HttpError("Assign tasks to an active member of this project team.", 400);
+  const assignedTeam = stringArray(project.data()?.assignedTeam);
+  if (user.role === "team_member" && !assignedTeam.includes(user.uid)) {
+    throw new HttpError("You can only assign tasks on projects you are working on yourself.", 403);
+  }
+  // Interns can be given tasks too, through the sign-in created with their intern record.
+  if (!assignee.exists || !isWorkspaceMember(String(assignee.data()?.role)) || assignee.data()?.accountStatus !== "active") {
+    throw new HttpError("Assign tasks to an active team member or intern.", 400);
+  }
+  if (!assignedTeam.includes(input.assigneeId)) {
+    // An intern chosen from the full list joins the project as part of being given work on it.
+    // Everyone else has to be put on the project first, which is a separate decision.
+    if (assignee.data()?.role !== "intern") throw new HttpError("Assign tasks to someone already on this project team.", 400);
+    await addInternToProject(input.assigneeId, input.projectId);
   }
   const ref = db.collection("tasks").doc();
   const batch = db.batch();
-  batch.set(ref, { ...input, id: ref.id, status: "open", assigneeName: assignee.data()?.displayName ?? "", createdBy: user.uid, createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
+  batch.set(ref, { ...input, id: ref.id, status: "open", assigneeName: assignee.data()?.displayName ?? "", createdBy: user.uid, createdByName: user.displayName, createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
   addAuditToBatch(batch, user, "task_assigned", "tasks", ref.id, { projectId: input.projectId, assigneeId: input.assigneeId });
   await batch.commit();
   void createNotification(input.assigneeId, "A task was assigned to you", input.title, "/workspace/tasks", "task_assignment").catch(() => undefined);
@@ -382,7 +404,7 @@ async function createMilestone(request: Request, user: Awaited<ReturnType<typeof
 }
 
 async function createReport(request: Request, user: Awaited<ReturnType<typeof requireSessionUser>>) {
-  if (user.role !== "team_member") throw new HttpError("Only team members can submit work reports.", 403);
+  if (!isWorkspaceMember(user.role)) throw new HttpError("Only team members and interns can submit work reports.", 403);
   const input = await parseBody(request, reportSchema);
   const db = adminDb();
   const project = await db.collection("projects").doc(input.projectId).get();
@@ -506,9 +528,13 @@ export async function POST(request: Request, context: { params: Promise<{ collec
     const { collection: rawCollection } = await context.params;
     const collection = ensureCollection(rawCollection);
     const canCreate = user.role === "super_admin"
-      || collection === "projects"
-      || collection === "clients" && user.role !== "team_member"
-      || collection === "workReports" && user.role === "team_member";
+      || collection === "projects" && user.role !== "intern"
+      || collection === "clients" && !isWorkspaceMember(user.role)
+      || collection === "workReports" && isWorkspaceMember(user.role)
+      // A full-time employee takes on interns and gives them work on their own projects.
+      || collection === "interns" && user.role === "team_member"
+      || collection === "tasks" && (user.role === "cto" || user.role === "team_member")
+      || collection === "milestones" && user.role === "cto";
     if (!canCreate) {
       throw new HttpError("You cannot create this record type.", 403);
     }

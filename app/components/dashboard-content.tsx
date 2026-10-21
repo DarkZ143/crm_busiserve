@@ -2,6 +2,7 @@ import Link from "next/link";
 import { Activity, AlarmClock, BriefcaseBusiness, Building2, CheckCircle2, ClipboardCheck, ClipboardList, FolderKanban, ListTodo, UsersRound } from "lucide-react";
 import { ApplicationShell } from "@/app/components/application-shell";
 import { ProjectStatusChart } from "@/app/components/project-status-chart";
+import { isWorkspaceMember } from "@/lib/access-control";
 import type { RecordData, Role, SessionUser } from "@/lib/types";
 
 type DashboardData = {
@@ -53,6 +54,7 @@ const roleCopy: Record<Role, { title: string; section: string; description: stri
   cto: { title: "Operations overview", section: "Dashboard", description: "Review requests, delivery risk, and work awaiting your attention." },
   product_manager: { title: "Your portfolio", section: "Dashboard", description: "Follow onboarding, project decisions, and updates from delivery." },
   team_member: { title: "My workspace", section: "Dashboard", description: "See today’s assignments and keep your work reports current." },
+  intern: { title: "My workspace", section: "Dashboard", description: "See the tasks assigned to you and keep your work reports current." },
 };
 
 function getStats(user: SessionUser, data: DashboardData) {
@@ -121,7 +123,7 @@ export function DashboardContent({ user, data, titleOverride, sectionOverride }:
       title={title}
       section={section}
       description={meta.description}
-      headerActions={<Link className="button button-secondary" href={firstLink}>{user.role === "team_member" ? "Submit daily report" : user.role === "cto" ? "Review requests" : "View work"}</Link>}
+      headerActions={<Link className="button button-secondary" href={firstLink}>{isWorkspaceMember(user.role) ? "Submit daily report" : user.role === "cto" ? "Review requests" : "View work"}</Link>}
       notifications={data.notifications}
     >
       <div className="stats-grid">
